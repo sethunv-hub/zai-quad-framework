@@ -1,0 +1,33 @@
+# Render.com configuration — ZAI QUAD FRAMEWORK cloud server
+# Free tier: 512MB RAM, 0.1 CPU, sleeps after 15 min of inactivity
+# We keep it awake with a free ping service (cron-job.org)
+
+services:
+  - type: web
+    name: zai-quad-framework   # CHANGE to something unique like "sethu-quad-smc"
+    runtime: node
+    plan: free                  # Free tier
+    region: singapore           # Closest to Manila
+    branch: main
+    rootDir: .
+    buildCommand: npm install --production
+    startCommand: node server.js
+    healthCheckPath: /ping      # Render pings this to verify the service is up
+    autoDeploy: true
+    envVars:
+      - key: NTFY_TOPIC
+        value: sethu-btc
+      - key: MIN_GRADE
+        value: A
+      # Exness offsets — set these after first deploy via Render dashboard
+      # or here in render.yaml. Use the values from your browser syncBtc/syncGold/etc.
+      - key: BTC_OFFSET
+        value: "0"
+      - key: GOLD_OFFSET
+        value: "0"
+      - key: SILVER_OFFSET
+        value: "0"
+      - key: EUR_OFFSET
+        value: "0"
+      - key: NODE_VERSION
+        value: 20.0.0

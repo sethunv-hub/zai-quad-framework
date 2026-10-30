@@ -1,0 +1,15 @@
+{
+  "name": "zai-quad-framework-server",
+  "version": "1.0.0",
+  "description": "SMC Liquidity Zone signal server — pushes ntfy alerts for BTC, Gold, Silver, EUR/USD",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
