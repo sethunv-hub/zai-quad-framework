@@ -373,10 +373,7 @@ function scanSig(e, minGrade, onSignal) {
   if (!result) { e.signal = { action: 'WAIT', reason: 'No setup' }; e.actSig = null; return; }
   if (result.action === 'LONG' || result.action === 'SHORT') {
     // Grade filter — only fire if quality meets minimum threshold
-    const gradeOrder = { A: 3, B: 2, C: 1 };
-    const minOrder = gradeOrder[minGrade] || 3;
-    const resultOrder = gradeOrder[result.quality] || 0;
-    if (resultOrder < minOrder) {
+    if (!minGrade || minGrade.indexOf(result.quality) < 0) {
       e.signal = { action: 'WATCH', reason: `${result.quality}-grade below ${minGrade}-only filter` };
       e.actSig = null;
       return;
