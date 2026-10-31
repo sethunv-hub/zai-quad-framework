@@ -3,7 +3,7 @@
 // No dashboard. No browser. Just signals to your phone.
 
 const WebSocket = require('ws');
-const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias } = require('./smc-engine');
+const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias, detectSwings, updateZones, updateBias } = require('./smc-engine');
 
 // ===== CONFIGURATION =====
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
@@ -127,29 +127,73 @@ function curSessName() {
   return null;
 }
 
-// ===== WEBSOCKET CONNECTIONS — one per instrument =====
+// ===== WEBSOCKET CONNECTIONS — use kline stream for candle data =====
 const sockets = {};
 
 function connect(e) {
   const host = e.config.futures ? 'fstream.binance.com' : 'stream.binance.com:9443';
-  const url = `wss://${host}/ws/${e.stream}@trade`;
+  // Use kline stream instead of trade stream — gives us full candle data
+  const url = `wss://${host}/ws/${e.stream}@kline_15m`;
 
   console.log(`[${e.symbol}] Connecting to ${url}`);
   const ws = new WebSocket(url);
   sockets[e.symbol] = ws;
 
   ws.on('open', () => {
-    console.log(`[${e.symbol}] ✓ Connected (live)`);
+    console.log(`[${e.symbol}] ✓ Connected (live, kline stream)`);
+    // Try REST bootstrap in background (might fail, that's OK)
+    bootstrap(e, offsetMap[e.symbol] || 0);
   });
 
   ws.on('message', (data) => {
     try {
       const d = JSON.parse(data.toString());
-      if (d.p) {
+      // Kline stream format: { k: { t, o, h, l, c, v, x: isClosed, ... } }
+      if (d.k) {
+        const k = d.k;
+        const offset = offsetMap[e.symbol] || 0;
+        const price = parseFloat(k.c) + offset; // current price from candle close
+        
+        // Update the current 15m candle in e.c15
+        const candleKey = Math.floor(k.t / 60000 / 15);
+        const existing = e.c15[e.c15.length - 1];
+        
+        if (!existing || existing.key !== candleKey) {
+          // New candle — add it
+          e.c15.push({
+            key: candleKey,
+            o: parseFloat(k.o) + offset,
+            h: parseFloat(k.h) + offset,
+            l: parseFloat(k.l) + offset,
+            c: parseFloat(k.c) + offset,
+            t: new Date(k.t)
+          });
+          if (e.c15.length > 100) e.c15.shift();
+          if (e.c15.length >= 5) {
+            detectSwings(e); updateZones(e); updateBias(e);
+            e.atr = calcAtr(e);
+          }
+        } else {
+          // Update existing candle
+          existing.h = Math.max(existing.h, parseFloat(k.h) + offset);
+          existing.l = Math.min(existing.l, parseFloat(k.l) + offset);
+          existing.c = parseFloat(k.c) + offset;
+        }
+        
+        // Always set price and run scan
+        e.prev = e.price; e.price = price;
+        e.ph.push({ t: new Date(), p: price });
+        if (e.ph.length > 500) e.ph.shift();
+        
+        if (e.c15.length >= 5) {
+          try { scanSig(e, CONFIG.minGrade, onSignal); } catch (err) { console.error(`[${e.symbol}] scanSig error:`, err.message); }
+        } else {
+          e.signal = { action: 'WAIT', reason: `Building candles (${e.c15.length}/5)` };
+        }
+      } else if (d.p) {
+        // Fallback: trade stream format (if kline not available)
         const price = parseFloat(d.p);
         handlePrice(e, price, offsetMap[e.symbol] || 0);
-        // scanSig runs inside handlePrice via the engine
-        // But we need to call it explicitly here with the min grade filter + onSignal callback
         scanSig(e, CONFIG.minGrade, onSignal);
       }
     } catch (ex) {
@@ -166,7 +210,7 @@ function connect(e) {
     setTimeout(() => connect(e), CONFIG.reconnectDelay);
   });
 
-  // Heartbeat check — if no message in 45s, force reconnect
+  // Heartbeat check
   if (!e._heartbeatInterval) {
     e._heartbeatInterval = setInterval(() => {
       if (e.lhb && Date.now() - e.lhb > 45000) {

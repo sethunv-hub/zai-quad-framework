@@ -826,5 +826,6 @@ function evaluate(e) {
 }
 
 module.exports = {
-  makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias
+  makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias,
+  detectSwings, updateZones, updateBias
 };
