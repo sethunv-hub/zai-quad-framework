@@ -128,60 +128,77 @@ function calcAsiaRange(e) {
   return any ? { hi, lo } : null;
 }
 
-// ===== Bootstrap: fetch 15m + 1H + daily candles =====
+// ===== Bootstrap: fetch 15m + 1H + daily candles (independent — one failure doesn't kill all) =====
 async function bootstrap(e, offset) {
   if (e.c15.length >= 50) return;
+  const base = e.config.futures
+    ? 'https://fapi.binance.com/fapi/v1/klines'
+    : 'https://api.binance.com/api/v3/klines';
+  const sym = e.stream.toUpperCase();
+  
+  // Fetch each independently so one failure doesn't break everything
+  // 15m candles (most important)
   try {
-    const base = e.config.futures
-      ? 'https://fapi.binance.com/fapi/v1/klines'
-      : 'https://api.binance.com/api/v3/klines';
-    const sym = e.stream.toUpperCase();
-    const [r15, r1h, r1d] = await Promise.all([
-      fetch(base + '?symbol=' + sym + '&interval=15m&limit=100'),
-      fetch(base + '?symbol=' + sym + '&interval=1h&limit=100'),
-      fetch(base + '?symbol=' + sym + '&interval=1d&limit=5')
-    ]);
-    
-    // 15m candles
+    const r15 = await fetch(base + '?symbol=' + sym + '&interval=15m&limit=100');
     const d15 = await r15.json();
-    if (Array.isArray(d15)) {
+    if (Array.isArray(d15) && d15.length > 0) {
       e.c15 = d15.map(k => ({
         key: Math.floor(k[0]/60000/15),
         o: parseFloat(k[1])+offset, h: parseFloat(k[2])+offset,
         l: parseFloat(k[3])+offset, c: parseFloat(k[4])+offset,
         t: new Date(k[0])
       }));
+      console.log(`[${e.symbol}] Loaded ${e.c15.length} 15m candles`);
+    } else {
+      console.warn(`[${e.symbol}] 15m fetch returned non-array:`, d15);
     }
-    
-    // 1H candles
+  } catch (err) {
+    console.warn(`[${e.symbol}] 15m bootstrap failed:`, err.message);
+  }
+  
+  // 1H candles
+  try {
+    const r1h = await fetch(base + '?symbol=' + sym + '&interval=1h&limit=100');
     const d1h = await r1h.json();
-    if (Array.isArray(d1h)) {
+    if (Array.isArray(d1h) && d1h.length > 0) {
       e.htf = d1h.map(k => ({
         o: parseFloat(k[1])+offset, h: parseFloat(k[2])+offset,
         l: parseFloat(k[3])+offset, c: parseFloat(k[4])+offset,
         t: new Date(k[0])
       }));
+      console.log(`[${e.symbol}] Loaded ${e.htf.length} 1H candles`);
+    } else {
+      console.warn(`[${e.symbol}] 1H fetch returned non-array:`, d1h);
     }
-    
-    // Daily candles (for PDH/PDL)
+  } catch (err) {
+    console.warn(`[${e.symbol}] 1H bootstrap failed:`, err.message);
+  }
+  
+  // Daily candles
+  try {
+    const r1d = await fetch(base + '?symbol=' + sym + '&interval=1d&limit=5');
     const d1d = await r1d.json();
     if (Array.isArray(d1d) && d1d.length >= 2) {
       const prev = d1d[d1d.length - 2];
       e.daily = { pdh: parseFloat(prev[2])+offset, pdl: parseFloat(prev[3])+offset };
       e.pdh = e.daily.pdh;
       e.pdl = e.daily.pdl;
+      console.log(`[${e.symbol}] Loaded daily: PDH=${e.pdh}, PDL=${e.pdl}`);
     }
-    
+  } catch (err) {
+    console.warn(`[${e.symbol}] Daily bootstrap failed:`, err.message);
+  }
+  
+  if (e.c15.length > 0) {
     e.asiaRange = calcAsiaRange(e);
     e.atr = calcAtr(e);
-    
     const last = e.c15[e.c15.length - 1];
     e.cb = [{ minuteKey: Math.floor(Date.now()/60000), o: last.c, h: last.c, l: last.c, c: last.c, t: new Date() }];
     detectSwings(e); updateZones(e); updateBias(e);
     if (e.price == null) handlePrice(e, last.c, offset);
-    console.log(`[${e.symbol}] Bootstrapped: ${e.c15.length}×15m, ${e.htf.length}×1H, ATR=${e.atr.toFixed(2)}, price=${fmtPrice(e.symbol, last.c)}`);
-  } catch (err) {
-    console.warn(`[${e.symbol}] Bootstrap failed:`, err.message);
+    console.log(`[${e.symbol}] Bootstrap complete: ${e.c15.length}×15m, ${e.htf.length}×1H, ATR=${e.atr.toFixed(2)}, bias=${e.bias}, price=${fmtPrice(e.symbol, last.c)}`);
+  } else {
+    console.error(`[${e.symbol}] Bootstrap FAILED — no 15m candles loaded. Will retry on next price tick.`);
   }
 }
 
@@ -227,6 +244,12 @@ function bootPD(e) {
 
 function handlePrice(e, price, offset) {
   if (!price || price < 0.5 || price > 1000000) return;
+  // Auto-retry bootstrap if c15 is empty (handles failed initial bootstrap)
+  if (e.c15.length === 0) {
+    console.log(`[${e.symbol}] c15 empty on price tick — retrying bootstrap`);
+    bootstrap(e, offset);
+    return; // skip this tick, will process next one after bootstrap
+  }
   const adj = offset !== 0 ? price + offset : price;
   e.prev = e.price; e.price = adj;
   e.ph.push({ t: new Date(), p: adj });
@@ -394,7 +417,7 @@ function updateBias(e) {
   if (hb === 'bull') { e.bias = 'bullish'; e.bd = { strength: 4, structure: '1H HH+HL', displacement: 'Normal' }; return; }
   if (hb === 'bear') { e.bias = 'bearish'; e.bd = { strength: 4, structure: '1H LH+LL', displacement: 'Normal' }; return; }
   
-  // 1H range — fall back to 15m momentum
+  // 1H range — fall back to 15m swing structure, then momentum
   const r = c.slice(-20);
   const swH = [], swL = [];
   for (let i = 2; i < r.length - 2; i++) {
@@ -412,8 +435,27 @@ function updateBias(e) {
     else if (hh && !hl) { sb = 'bullish'; st = 2; }
     else if (ll && !lh) { sb = 'bearish'; st = 2; }
   }
+  
+  // If swing structure inconclusive, fall back to 4-candle momentum
+  if (sb === 'neutral' && c.length >= 4) {
+    const l4 = c.slice(-4);
+    const bC = l4.filter(x => x.c < x.o).length;
+    const buC = l4.filter(x => x.c > x.o).length;
+    if (bC === 4) { sb = 'bearish'; st = 2; }
+    else if (buC === 4) { sb = 'bullish'; st = 2; }
+    else if (c.length >= 10) {
+      const l10 = c.slice(-10);
+      const sma = l10.reduce((s, x) => s + x.c, 0) / 10;
+      const dev = (c[c.length-1].c - sma) / sma;
+      const bC10 = l10.filter(x => x.c < x.o).length;
+      const buC10 = l10.filter(x => x.c > x.o).length;
+      if (dev < -0.003 && bC10 >= 6) { sb = 'bearish'; st = 2; }
+      else if (dev > 0.003 && buC10 >= 6) { sb = 'bullish'; st = 2; }
+    }
+  }
+  
   e.bias = sb;
-  e.bd = st > 0 ? { strength: st, structure: '15m swing', displacement: 'Normal' } : null;
+  e.bd = st > 0 ? { strength: st, structure: st >= 3 ? '15m swing' : '15m momentum', displacement: 'Normal' } : null;
 }
 
 function isConsumed(e, s) {
