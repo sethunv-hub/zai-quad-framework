@@ -3,7 +3,7 @@
 // No dashboard. No browser. Just signals to your phone.
 
 const WebSocket = require('ws');
-const { makeEngine, bootstrap, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend } = require('./smc-engine');
+const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias } = require('./smc-engine');
 
 // ===== CONFIGURATION =====
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
@@ -70,32 +70,47 @@ function onSignal(e, sig) {
   const instShort = nameMap[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
-  const title = `${emoji} ZAI ${instShort} ${dir}`;
+  const title = `${emoji} ZAI ${instShort} ${dir} [${sig.quality} ${sig.score}/9]`;
   const phtStr = fmtPht(Date.now());
+  
+  // Build checklist summary (which checks passed)
+  const checkSummary = sig.checks ? sig.checks.filter(c => c.ok).map(c => c.k).join('+') : '';
+  
+  // Position sizing (0.5% of $500 default account)
+  const account = parseFloat(process.env.ACCOUNT_SIZE || '500');
+  const riskPct = parseFloat(process.env.RISK_PCT || '0.5');
+  const riskUsd = account * riskPct / 100;
+  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'XAU' ? 100 : e.symbol === 'XAG' ? 1000 : 100000;
+  const lotsRaw = riskUsd / (sig.zoneRisk * contractSize);
+  const lots = Math.floor(lotsRaw * 100) / 100;
+  
   const msg = `Entry: ${fmtPrice(e.symbol, sig.entry)}
-SL: ${fmtPrice(e.symbol, sig.sl)}
-TP: ${fmtPrice(e.symbol, sig.tp1)}
-Time (PHT): ${phtStr}
-Grade: ${sig.quality} • Conf ${sig.confidence}/5
-Trigger: ${sig.trigger || 'Confluence'}
-Sweep: ${sig.sweep.name}`;
+SL: ${fmtPrice(e.symbol, sig.sl)} (ATR)
+TP1: ${fmtPrice(e.symbol, sig.tp1)} (${sig.rr1.toFixed(1)}R)${sig.tp2 ? ' | TP2: ' + fmtPrice(e.symbol, sig.tp2) + ' (' + sig.rr2.toFixed(1) + 'R)' : ''}
+1H: ${sig.htfBias || '—'} | Trigger: ${sig.trigger || '—'}
+Sweep: ${sig.sweep.name}${sig.poi ? ' | POI: ' + sig.poi.type : ''} | KZ: ${sig.killZone ? '✓' : '✗'}
+Score: ${sig.score}/9 (${checkSummary}) | Time: ${phtStr}
+Risk: $${riskUsd.toFixed(0)} → ${lots} lots`;
 
   console.log(`\n[${new Date().toISOString()}] ${title}`);
   console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
 
   sendNtfy(title, msg);
 
-  // Log to journal (in-memory — for export via /journal endpoint if needed)
+  // Log to journal
   journal.push({
     timestamp: new Date().toISOString(),
     instrument: e.symbol,
     action: sig.action,
     grade: sig.quality,
+    score: sig.score,
     entryType: sig.entryType,
     entry: sig.entry, sl: sig.sl,
     tp1: sig.tp1, tp2: sig.tp2, tp3: sig.tp3,
-    zoneRisk: sig.zoneRisk, rr1: sig.rr1,
+    zoneRisk: sig.zoneRisk, rr1: sig.rr1, rr2: sig.rr2,
     sweep: sig.sweep.name, trigger: sig.trigger,
+    poi: sig.poi ? sig.poi.type : null,
+    htfBias: sig.htfBias,
     bias: e.bias, session: curSessName(),
     outcome: 'pending'
   });
@@ -258,9 +273,14 @@ server.listen(PORT, HOST, () => {
     console.log(`\n[${new Date().toISOString()}] All engines connected. Watching for signals...\n`);
   })();
 
+  // Refresh 1H candles every 5 min (keeps HTF bias current)
+  setInterval(() => {
+    engines.forEach(e => refreshHtf(e, offsetMap[e.symbol] || 0));
+  }, 300000);
+
   // Status log every 5 minutes
   setInterval(() => {
-    const status = engines.map(e => `${e.symbol}:${e.signal ? e.signal.action : 'WAIT'}`).join(' ');
+    const status = engines.map(e => `${e.symbol}:${e.signal ? e.signal.action : 'WAIT'}(${e.bias})`).join(' ');
     console.log(`[status ${new Date().toISOString().slice(11, 19)}] ${status}`);
   }, 300000);
 });
