@@ -223,7 +223,7 @@ function connect(e) {
 
 // ===== HTTP SERVER — minimal, just for health check + journal export =====
 const http = require('http');
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   // Lightweight ping endpoint — for Render free-tier keep-alive services (cron-job.org, UptimeRobot)
@@ -269,6 +269,44 @@ const server = http.createServer((req, res) => {
     }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ uptime: process.uptime(), engines: status }, null, 2));
+    return;
+  }
+
+  // Test endpoint — shows what Binance API returns from this server
+  if (req.url === '/test-fetch') {
+    try {
+      const r = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=3');
+      const text = await r.text();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        status: r.status, 
+        ok: r.ok,
+        bodyPreview: text.slice(0, 500),
+        isArray: text.startsWith('[')
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message, stack: err.stack }, null, 2));
+    }
+    return;
+  }
+
+  // Test endpoint 2 — try the fallback endpoint
+  if (req.url === '/test-fetch2') {
+    try {
+      const r = await fetch('https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=3');
+      const text = await r.text();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        status: r.status, 
+        ok: r.ok,
+        bodyPreview: text.slice(0, 500),
+        isArray: text.startsWith('[')
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }, null, 2));
+    }
     return;
   }
 
