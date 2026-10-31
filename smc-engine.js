@@ -244,16 +244,22 @@ function bootPD(e) {
 
 function handlePrice(e, price, offset) {
   if (!price || price < 0.5 || price > 1000000) return;
-  // Auto-retry bootstrap if c15 is empty (handles failed initial bootstrap)
-  if (e.c15.length === 0) {
-    console.log(`[${e.symbol}] c15 empty on price tick — retrying bootstrap`);
-    bootstrap(e, offset);
-    return; // skip this tick, will process next one after bootstrap
-  }
+  // Always set price first — even if c15 is empty, we want /health to show live prices
   const adj = offset !== 0 ? price + offset : price;
   e.prev = e.price; e.price = adj;
   e.ph.push({ t: new Date(), p: adj });
   if (e.ph.length > 500) e.ph.shift();
+  // Auto-retry bootstrap if c15 is empty — but only once per 30 seconds (avoids rate limits)
+  if (e.c15.length === 0) {
+    const now = Date.now();
+    if (!e._lastBootstrapRetry || now - e._lastBootstrapRetry > 30000) {
+      e._lastBootstrapRetry = now;
+      console.log(`[${e.symbol}] c15 empty on price tick — retrying bootstrap`);
+      bootstrap(e, offset);
+    }
+    e.signal = { action: 'WAIT', reason: 'Building candles…' };
+    return;
+  }
   try {
     updateCB(e, adj); updateSess(e, adj);
     updateZones(e); detectSweeps(e); updateBias(e);
