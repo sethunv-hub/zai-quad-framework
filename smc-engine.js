@@ -128,20 +128,39 @@ function calcAsiaRange(e) {
   return any ? { hi, lo } : null;
 }
 
-// ===== Bootstrap: fetch 15m + 1H + daily candles (independent — one failure doesn't kill all) =====
+// ===== Bootstrap: fetch 15m + 1H + daily candles (with fallback endpoints) =====
+async function fetchKlines(base, sym, interval, limit) {
+  const r = await fetch(base + '?symbol=' + sym + '&interval=' + interval + '&limit=' + limit);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const data = await r.json();
+  if (!Array.isArray(data)) throw new Error('Non-array response: ' + JSON.stringify(data).slice(0, 100));
+  return data;
+}
+
 async function bootstrap(e, offset) {
   if (e.c15.length >= 50) return;
-  const base = e.config.futures
-    ? 'https://fapi.binance.com/fapi/v1/klines'
-    : 'https://api.binance.com/api/v3/klines';
+  // Try multiple endpoints — Binance sometimes rate-limits or blocks cloud IPs
+  const endpoints = e.config.futures
+    ? ['https://fapi.binance.com/fapi/v1/klines']
+    : ['https://api.binance.com/api/v3/klines', 'https://data-api.binance.vision/api/v3/klines'];
   const sym = e.stream.toUpperCase();
-  
-  // Fetch each independently so one failure doesn't break everything
+
+  // Helper: try each endpoint until one works
+  async function tryFetch(interval, limit) {
+    for (const ep of endpoints) {
+      try {
+        return await fetchKlines(ep, sym, interval, limit);
+      } catch (err) {
+        console.warn(`[${e.symbol}] ${interval} fetch from ${ep.split('//')[1].split('/')[0]} failed: ${err.message}`);
+      }
+    }
+    return null;
+  }
+
   // 15m candles (most important)
   try {
-    const r15 = await fetch(base + '?symbol=' + sym + '&interval=15m&limit=100');
-    const d15 = await r15.json();
-    if (Array.isArray(d15) && d15.length > 0) {
+    const d15 = await tryFetch('15m', 100);
+    if (d15 && d15.length > 0) {
       e.c15 = d15.map(k => ({
         key: Math.floor(k[0]/60000/15),
         o: parseFloat(k[1])+offset, h: parseFloat(k[2])+offset,
@@ -150,35 +169,31 @@ async function bootstrap(e, offset) {
       }));
       console.log(`[${e.symbol}] Loaded ${e.c15.length} 15m candles`);
     } else {
-      console.warn(`[${e.symbol}] 15m fetch returned non-array:`, d15);
+      console.error(`[${e.symbol}] 15m fetch failed from all endpoints`);
     }
   } catch (err) {
-    console.warn(`[${e.symbol}] 15m bootstrap failed:`, err.message);
+    console.warn(`[${e.symbol}] 15m bootstrap error:`, err.message);
   }
-  
+
   // 1H candles
   try {
-    const r1h = await fetch(base + '?symbol=' + sym + '&interval=1h&limit=100');
-    const d1h = await r1h.json();
-    if (Array.isArray(d1h) && d1h.length > 0) {
+    const d1h = await tryFetch('1h', 100);
+    if (d1h && d1h.length > 0) {
       e.htf = d1h.map(k => ({
         o: parseFloat(k[1])+offset, h: parseFloat(k[2])+offset,
         l: parseFloat(k[3])+offset, c: parseFloat(k[4])+offset,
         t: new Date(k[0])
       }));
       console.log(`[${e.symbol}] Loaded ${e.htf.length} 1H candles`);
-    } else {
-      console.warn(`[${e.symbol}] 1H fetch returned non-array:`, d1h);
     }
   } catch (err) {
     console.warn(`[${e.symbol}] 1H bootstrap failed:`, err.message);
   }
-  
+
   // Daily candles
   try {
-    const r1d = await fetch(base + '?symbol=' + sym + '&interval=1d&limit=5');
-    const d1d = await r1d.json();
-    if (Array.isArray(d1d) && d1d.length >= 2) {
+    const d1d = await tryFetch('1d', 5);
+    if (d1d && d1d.length >= 2) {
       const prev = d1d[d1d.length - 2];
       e.daily = { pdh: parseFloat(prev[2])+offset, pdl: parseFloat(prev[3])+offset };
       e.pdh = e.daily.pdh;
@@ -188,7 +203,7 @@ async function bootstrap(e, offset) {
   } catch (err) {
     console.warn(`[${e.symbol}] Daily bootstrap failed:`, err.message);
   }
-  
+
   if (e.c15.length > 0) {
     e.asiaRange = calcAsiaRange(e);
     e.atr = calcAtr(e);
@@ -198,29 +213,31 @@ async function bootstrap(e, offset) {
     if (e.price == null) handlePrice(e, last.c, offset);
     console.log(`[${e.symbol}] Bootstrap complete: ${e.c15.length}×15m, ${e.htf.length}×1H, ATR=${e.atr.toFixed(2)}, bias=${e.bias}, price=${fmtPrice(e.symbol, last.c)}`);
   } else {
-    console.error(`[${e.symbol}] Bootstrap FAILED — no 15m candles loaded. Will retry on next price tick.`);
+    console.error(`[${e.symbol}] Bootstrap FAILED — no 15m candles loaded. Will retry in 30s.`);
   }
 }
 
 // ===== Refresh 1H candles (called every 5 min from server) =====
 async function refreshHtf(e, offset) {
-  try {
-    const base = e.config.futures
-      ? 'https://fapi.binance.com/fapi/v1/klines'
-      : 'https://api.binance.com/api/v3/klines';
-    const r = await fetch(base + '?symbol=' + e.stream.toUpperCase() + '&interval=1h&limit=50');
-    const data = await r.json();
-    if (Array.isArray(data)) {
-      e.htf = data.map(k => ({
-        o: parseFloat(k[1])+offset, h: parseFloat(k[2])+offset,
-        l: parseFloat(k[3])+offset, c: parseFloat(k[4])+offset,
-        t: new Date(k[0])
-      }));
+  const endpoints = e.config.futures
+    ? ['https://fapi.binance.com/fapi/v1/klines']
+    : ['https://api.binance.com/api/v3/klines', 'https://data-api.binance.vision/api/v3/klines'];
+  const sym = e.stream.toUpperCase();
+  for (const ep of endpoints) {
+    try {
+      const r = await fetch(ep + '?symbol=' + sym + '&interval=1h&limit=100');
+      const data = await r.json();
+      if (Array.isArray(data) && data.length > 0) {
+        e.htf = data.map(k => ({
+          o: parseFloat(k[1])+offset, h: parseFloat(k[2])+offset,
+          l: parseFloat(k[3])+offset, c: parseFloat(k[4])+offset,
+          t: new Date(k[0])
+        }));
+        return;
+      }
+    } catch (err) {
+      console.warn(`[${e.symbol}] HTF refresh from ${ep.split('//')[1].split('/')[0]} failed:`, err.message);
     }
-    // Refresh Asia range too
-    e.asiaRange = calcAsiaRange(e);
-  } catch (err) {
-    console.warn(`[${e.symbol}] HTF refresh failed:`, err.message);
   }
 }
 
