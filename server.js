@@ -205,6 +205,29 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.url === '/debug') {
+    const status = engines.map(e => ({
+      symbol: e.symbol,
+      price: e.price,
+      bias: e.bias,
+      c15len: e.c15 ? e.c15.length : 0,
+      htfLen: e.htf ? e.htf.length : 0,
+      hasDaily: !!e.daily,
+      atr: e.atr || 0,
+      pdh: e.pdh,
+      pdl: e.pdl,
+      swH: e.swH ? e.swH.length : 0,
+      swL: e.swL ? e.swL.length : 0,
+      zones: e.zones ? e.zones.length : 0,
+      swept: e.swept ? e.swept.length : 0,
+      lastBootstrapRetry: e._lastBootstrapRetry ? new Date(e._lastBootstrapRetry).toISOString() : null,
+      signal: e.signal ? e.signal.action + ': ' + e.signal.reason : 'NONE'
+    }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ uptime: process.uptime(), engines: status }, null, 2));
+    return;
+  }
+
   if (req.url === '/journal') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(journal, null, 2));
