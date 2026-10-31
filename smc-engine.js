@@ -36,8 +36,8 @@ function isSessWin() {
 function isFxWeekend() {
   var d = new Date();
   var day = d.getUTCDay(), h = d.getUTCHours();
-  if (day === 5 && h >= 14) return true;       // Friday after 14:00 UTC = Fri 22:00 PHT
-  if (day === 6 && h < 16) return true;        // Saturday before 16:00 UTC = Sat 23:59 PHT
+  if (day === 5 && h >= 14) return true;
+  if (day === 6 && h < 16) return true;
   return false;
 }
 
@@ -57,7 +57,6 @@ function fmtPrice(symbol, n) {
   return '$' + n;
 }
 
-// Bootstrap historical candles from Binance REST API
 async function bootstrap(e, offset) {
   if (e.c15.length >= 50) return;
   try {
@@ -306,7 +305,6 @@ function updateBias(e) {
 
   let bias = sb;
   if (mb !== 'neutral' && mb !== sb) {
-    // Stronger counter-trend filter — only allow flip if structure or macro agrees
     const structureAgrees = (mb === 'bullish' && sb === 'bullish') || (mb === 'bearish' && sb === 'bearish');
     const macroAgrees = (mb === 'bullish' && mBull) || (mb === 'bearish' && mBear);
     const macroNeutral = !mBull && !mBear;
@@ -321,6 +319,18 @@ function updateBias(e) {
     }
   } else if (mb === sb && mb !== 'neutral') { st = Math.min(5, st + 1); str += mn; }
   else if (mn) str += mn;
+
+  // BIAS STICKINESS — keep prior bias during small pullbacks
+  if (bias === 'neutral' && e.bd && e.bd.strength >= 3 && e.bias && e.bias !== 'neutral') {
+    const priorBias = e.bias;
+    const macroStillAgrees = (priorBias === 'bullish' && mBull) || (priorBias === 'bearish' && mBear);
+    const candlesUnanimousOpposite = (priorBias === 'bullish' && bC >= 4) || (priorBias === 'bearish' && buC >= 4);
+    if (macroStillAgrees && !candlesUnanimousOpposite) {
+      bias = priorBias;
+      str += ' [sticky]';
+      st = Math.max(2, st);
+    }
+  }
 
   if (c.length >= 6) {
     const l3 = c.slice(-3), p3 = c.slice(-6, -3);
@@ -351,7 +361,6 @@ function scanSig(e, minGrade, onSignal) {
     e.signal = e.actSig; e.signal.currentPrice = e.price;
     return;
   }
-  // Graduated cooldown by last signal grade
   if (e.lastFireTime && e.lastFireQuality) {
     const cdMins = { A: 10, B: 25, C: 45 }[e.lastFireQuality] || 30;
     const elapsed = now - e.lastFireTime;
@@ -372,13 +381,11 @@ function scanSig(e, minGrade, onSignal) {
   const result = evaluate(e);
   if (!result) { e.signal = { action: 'WAIT', reason: 'No setup' }; e.actSig = null; return; }
   if (result.action === 'LONG' || result.action === 'SHORT') {
-    // Grade filter — only fire if quality meets minimum threshold
     if (!minGrade || minGrade.indexOf(result.quality) < 0) {
       e.signal = { action: 'WATCH', reason: `${result.quality}-grade below ${minGrade}-only filter` };
       e.actSig = null;
       return;
     }
-    // Invariant validation
     const errs = [];
     if (result.action === 'LONG' && result.sl >= result.entry) errs.push('SL above entry');
     if (result.action === 'SHORT' && result.sl <= result.entry) errs.push('SL below entry');
@@ -399,7 +406,6 @@ function scanSig(e, minGrade, onSignal) {
     e.lastFireTime = now;
     e.lastFireQuality = result.quality;
     e.sigFormedAt = now;
-    // Fire the alert callback
     if (onSignal) onSignal(e, result);
   } else {
     e.signal = result;
@@ -408,7 +414,6 @@ function scanSig(e, minGrade, onSignal) {
 }
 
 function evaluate(e) {
-  // Breakout check first
   if (e.c15.length >= 3) {
     const c2 = e.c15, l3 = c2.slice(-3);
     const ms = l3[2].c - l3[0].o;
@@ -463,7 +468,6 @@ function evaluate(e) {
   let trigger = null, entryType = 'smc';
   if (bias === 'bullish' && (isBuE || isPBu)) { trigger = 'Bullish engulfing'; entryType = 'smc'; }
   if (bias === 'bearish' && (isBE || isPE)) { trigger = 'Bearish engulfing'; entryType = 'smc'; }
-  // FVG confluence
   let confl = false, conflDesc = 'No FVG/OB';
   if (e.c15.length >= 3) {
     const l3c = e.c15.slice(-3);
@@ -476,17 +480,14 @@ function evaluate(e) {
       if (fL2 < fH2 && cp < fH2 && cp > fL2 - th2) { confl = true; conflDesc = 'FVG'; }
     }
   }
-  // Momentum trigger
   if (!trigger && e.bd && e.bd.strength >= 3 && majT.includes(sweep.type)) {
     const cb = bias === 'bullish' ? lc.c > sweep.level : lc.c < sweep.level;
     if (cb) { trigger = 'Momentum sweep'; entryType = 'momentum'; }
   }
-  // Breakout trigger
   if (!trigger && e.bd && e.bd.structure && e.bd.structure.indexOf('Breakout') >= 0) {
     trigger = bias === 'bullish' ? 'Bullish breakout' : 'Bearish breakout';
     entryType = 'breakout';
   }
-  // Pullback trigger
   if (!trigger && e.c15.length >= 10) {
     const r10 = e.c15.slice(-10);
     const mh = Math.max.apply(null, r10.map(x => x.h));
@@ -505,9 +506,30 @@ function evaluate(e) {
       }
     }
   }
+  // OPTION B: Breakout Continuation trigger
+  if (!trigger && e.c15.length >= 10 && e.bd && e.bd.strength >= 3) {
+    const lc2 = e.c15[e.c15.length - 1];
+    const body2 = Math.abs(lc2.c - lc2.o);
+    const range2 = lc2.h - lc2.l;
+    const prev10 = e.c15.slice(-11, -1);
+    const avgBody = prev10.reduce((s, x) => s + Math.abs(x.c - x.o), 0) / prev10.length;
+    const isStrongBody = body2 > avgBody * 1.5 && body2 > cp * 0.0015;
+    const closedTop25 = lc2.c > lc2.l + range2 * 0.75;
+    const closedBottom25 = lc2.c < lc2.l + range2 * 0.25;
+    if (isStrongBody && range2 > 0) {
+      if (bias === 'bullish' && closedTop25 && lc2.c > lc2.o) {
+        const lastSwingLow = e.swL.length > 0 ? Math.min.apply(null, e.swL.slice(-3)) : lc2.l;
+        sweep = { level: lastSwingLow, name: 'Swing L (continuation)', type: 'swing_low', time: new Date() };
+        trigger = 'Breakout continuation'; entryType = 'continuation';
+      } else if (bias === 'bearish' && closedBottom25 && lc2.c < lc2.o) {
+        const lastSwingHigh = e.swH.length > 0 ? Math.max.apply(null, e.swH.slice(-3)) : lc2.h;
+        sweep = { level: lastSwingHigh, name: 'Swing H (continuation)', type: 'swing_high', time: new Date() };
+        trigger = 'Breakout continuation'; entryType = 'continuation';
+      }
+    }
+  }
   if (!trigger && !confl) return { action: 'WATCH', reason: 'Sweep at ' + sweep.name + ' — waiting for trigger' };
 
-  // Entry = current market price; SL = sweep level ± buffer
   const entry = e.price;
   const slBuf = e.config.slBuffer;
   const sl = bias === 'bullish' ? sweep.level - slBuf : sweep.level + slBuf;
@@ -516,8 +538,10 @@ function evaluate(e) {
   const zr = Math.abs(entry - sl);
   const rwp = e.config.riskWidePct || 0.008;
   if (zr > cp * rwp) return { action: 'WAIT', reason: 'Risk too wide' };
+  // MIN SL FILTER — reject signals with SL too tight
+  const minSlPct = e.symbol === 'BTC' ? 0.003 : 0.002;
+  if (zr < cp * minSlPct) return { action: 'WAIT', reason: 'SL too tight (' + (zr / cp * 100).toFixed(2) + '% < ' + (minSlPct * 100).toFixed(1) + '%)' };
 
-  // Targets — liquidity zones in trade direction
   const untouched = e.zones.filter(z => !z.swept);
   const maxDist = Math.max(cp * 0.05, zr * 5);
   const scored = untouched.map(function (z) {
@@ -537,12 +561,15 @@ function evaluate(e) {
 
   let tp1, tp2, tp3;
   if (inDir.length === 0) {
-    const tp1L = bias === 'bullish' ? entry + zr * 1.5 : entry - zr * 1.5;
-    tp1 = { level: tp1L, stars: 1, name: 'Fallback' };
+    // FIX A: Remove math fallback — reject if no liquidity zone
+    return { action: 'WAIT', reason: 'No liquidity zone in trade direction for TP' };
   } else {
     const minTP1R = zr * 1.0;
     const tp1C = inDir.filter(z => Math.abs(z.level - entry) >= minTP1R);
     tp1 = tp1C[0] || inDir[0];
+    // FIX B: Max TP1 distance — reject if TP1 > 3R away
+    const tp1R = Math.abs(tp1.level - entry) / zr;
+    if (tp1R > 3.0) return { action: 'WAIT', reason: 'TP1 too far (' + tp1R.toFixed(1) + 'R) — entry too late' };
     const ms2 = cp * 0.001;
     const isLng = bias === 'bullish';
     const further = inDir.filter(z => z !== tp1 && (isLng ? (z.level > tp1.level + ms2) : (z.level < tp1.level - ms2)));
@@ -556,10 +583,12 @@ function evaluate(e) {
   if (bias === 'bullish' && tp1.level <= entry) return { action: 'WAIT', reason: 'TP1 below entry' };
   if (bias === 'bearish' && tp1.level >= entry) return { action: 'WAIT', reason: 'TP1 above entry' };
 
+  // FIX C: Require structural zone for B+ grade TP1
+  const isStructural = (z) => z && z.type !== 'round';
   let quality = 'C';
   const t3s = tp3 ? tp3.stars : 0, t2s = tp2 ? tp2.stars : 0;
-  if (t3s >= 3 && t2s >= 2 && trigger && confl) quality = 'A';
-  else if (t2s >= 2 && (trigger || confl)) quality = 'B';
+  if (t3s >= 3 && t2s >= 2 && trigger && confl && isStructural(tp1)) quality = 'A';
+  else if (t2s >= 2 && (trigger || confl) && isStructural(tp1)) quality = 'B';
 
   return {
     action: bias === 'bullish' ? 'LONG' : 'SHORT',

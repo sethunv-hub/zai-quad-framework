@@ -29,12 +29,12 @@ const engines = [
   makeEngine('XAU', 'paxgusdt', {
     prefix: 'gold', slBuffer: 2.5, minRisk: 6, maxRisk: 30,
     roundStars: 1, riskWidePct: 0.008, breakoutTh: 0.0015, pullbackTh: 0.005,
-    roundStep: 100, weekendSuppress: false, futures: false
+    roundStep: 100, weekendSuppress: true, futures: false
   }),
   makeEngine('XAG', 'xagusdt', {
     prefix: 'silver', slBuffer: 0.05, minRisk: 0.10, maxRisk: 0.50,
     roundStars: 2, riskWidePct: 0.015, breakoutTh: 0.003, pullbackTh: 0.007,
-    roundStep: 1, weekendSuppress: false, futures: true  // Silver only on Binance futures
+    roundStep: 1, weekendSuppress: true, futures: true  // Silver only on Binance futures
   }),
   makeEngine('EUR', 'eurusdt', {
     prefix: 'eur', slBuffer: 0.0008, minRisk: 0.0008, maxRisk: 0.0050,
