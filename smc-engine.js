@@ -266,12 +266,12 @@ function handlePrice(e, price, offset) {
   e.prev = e.price; e.price = adj;
   e.ph.push({ t: new Date(), p: adj });
   if (e.ph.length > 500) e.ph.shift();
-  // Auto-retry bootstrap if c15 is empty — but only once per 30 seconds (avoids rate limits)
+  // Auto-retry bootstrap if c15 is empty — but only once per 5 minutes (avoids rate limit bans)
   if (e.c15.length === 0) {
     const now = Date.now();
-    if (!e._lastBootstrapRetry || now - e._lastBootstrapRetry > 30000) {
+    if (!e._lastBootstrapRetry || now - e._lastBootstrapRetry > 300000) {
       e._lastBootstrapRetry = now;
-      console.log(`[${e.symbol}] c15 empty on price tick — retrying bootstrap`);
+      console.log(`[${e.symbol}] c15 empty on price tick — retrying bootstrap (5min cooldown)`);
       bootstrap(e, offset);
     }
     e.signal = { action: 'WAIT', reason: 'Building candles…' };

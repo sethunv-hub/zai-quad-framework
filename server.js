@@ -141,8 +141,10 @@ function connect(e) {
 
   ws.on('open', () => {
     console.log(`[${e.symbol}] ✓ Connected (live, kline stream)`);
-    // Try REST bootstrap in background (might fail, that's OK)
-    bootstrap(e, offsetMap[e.symbol] || 0);
+    // Try REST bootstrap only if c15 is empty (not on every reconnect)
+    if (e.c15.length === 0) {
+      bootstrap(e, offsetMap[e.symbol] || 0);
+    }
   });
 
   ws.on('message', (data) => {
