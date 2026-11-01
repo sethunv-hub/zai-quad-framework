@@ -129,8 +129,16 @@ function calcAsiaRange(e) {
 }
 
 // ===== Bootstrap: fetch 15m + 1H + daily candles (with fallback endpoints) =====
+// Global ban tracking — if Binance returns 418, stop retrying for 30 minutes
+let _binanceBannedUntil = 0;
+function isBinanceBanned() { return Date.now() < _binanceBannedUntil; }
+
 async function fetchKlines(base, sym, interval, limit) {
   const r = await fetch(base + '?symbol=' + sym + '&interval=' + interval + '&limit=' + limit);
+  if (r.status === 418 || r.status === 429) {
+    _binanceBannedUntil = Date.now() + 1800000; // 30 min cooldown
+    throw new Error('Binance rate-limited (HTTP ' + r.status + ') — cooldown 30min');
+  }
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const data = await r.json();
   if (!Array.isArray(data)) throw new Error('Non-array response: ' + JSON.stringify(data).slice(0, 100));
@@ -139,6 +147,7 @@ async function fetchKlines(base, sym, interval, limit) {
 
 async function bootstrap(e, offset) {
   if (e.c15.length >= 50) return;
+  if (isBinanceBanned()) { console.log(`[${e.symbol}] Bootstrap skipped — Binance banned for ${Math.ceil((_binanceBannedUntil - Date.now())/60000)}min`); return; }
   // Try multiple endpoints — Binance sometimes rate-limits or blocks cloud IPs
   const endpoints = e.config.futures
     ? ['https://fapi.binance.com/fapi/v1/klines']
@@ -440,8 +449,8 @@ function updateBias(e) {
   if (hb === 'bull') { e.bias = 'bullish'; e.bd = { strength: 4, structure: '1H HH+HL', displacement: 'Normal' }; return; }
   if (hb === 'bear') { e.bias = 'bearish'; e.bd = { strength: 4, structure: '1H LH+LL', displacement: 'Normal' }; return; }
   
-  // 1H range — fall back to 15m swing structure, then momentum
-  const r = c.slice(-20);
+  // 15m swing structure — use ALL available candles (not just last 20) for better bias detection
+  const r = c.slice(-Math.min(c.length, 50));
   const swH = [], swL = [];
   for (let i = 2; i < r.length - 2; i++) {
     if (r[i].h > r[i-1].h && r[i].h > r[i-2].h && r[i].h > r[i+1].h && r[i].h > r[i+2].h) swH.push({ h: r[i].h });
@@ -459,21 +468,19 @@ function updateBias(e) {
     else if (ll && !lh) { sb = 'bearish'; st = 2; }
   }
   
-  // If swing structure inconclusive, fall back to 4-candle momentum
+  // If swing structure inconclusive, fall back to momentum (lowered threshold for more signals)
   if (sb === 'neutral' && c.length >= 4) {
     const l4 = c.slice(-4);
     const bC = l4.filter(x => x.c < x.o).length;
     const buC = l4.filter(x => x.c > x.o).length;
-    if (bC === 4) { sb = 'bearish'; st = 2; }
-    else if (buC === 4) { sb = 'bullish'; st = 2; }
+    if (bC >= 3) { sb = 'bearish'; st = 2; }
+    else if (buC >= 3) { sb = 'bullish'; st = 2; }
     else if (c.length >= 10) {
       const l10 = c.slice(-10);
       const sma = l10.reduce((s, x) => s + x.c, 0) / 10;
       const dev = (c[c.length-1].c - sma) / sma;
-      const bC10 = l10.filter(x => x.c < x.o).length;
-      const buC10 = l10.filter(x => x.c > x.o).length;
-      if (dev < -0.003 && bC10 >= 6) { sb = 'bearish'; st = 2; }
-      else if (dev > 0.003 && buC10 >= 6) { sb = 'bullish'; st = 2; }
+      if (dev < -0.002) { sb = 'bearish'; st = 2; }
+      else if (dev > 0.002) { sb = 'bullish'; st = 2; }
     }
   }
   
