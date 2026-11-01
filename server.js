@@ -381,13 +381,25 @@ server.listen(PORT, HOST, () => {
   })();
 
   // Refresh 1H candles every 5 min (keeps HTF bias current)
+  // Also retry bootstrap if c15 < 50 (handles kline-stream-only mode where handlePrice retry doesn't fire)
   setInterval(() => {
-    engines.forEach(e => refreshHtf(e, offsetMap[e.symbol] || 0));
+    engines.forEach(e => {
+      refreshHtf(e, offsetMap[e.symbol] || 0);
+      // Retry bootstrap if we don't have enough candles
+      if (e.c15.length < 50) {
+        const now = Date.now();
+        if (!e._lastBootstrapRetry || now - e._lastBootstrapRetry > 300000) {
+          e._lastBootstrapRetry = now;
+          console.log(`[${e.symbol}] Periodic bootstrap retry (c15=${e.c15.length})`);
+          bootstrap(e, offsetMap[e.symbol] || 0);
+        }
+      }
+    });
   }, 300000);
 
   // Status log every 5 minutes
   setInterval(() => {
-    const status = engines.map(e => `${e.symbol}:${e.signal ? e.signal.action : 'WAIT'}(${e.bias})`).join(' ');
+    const status = engines.map(e => `${e.symbol}:c15=${e.c15.length}/${e.bias}`).join(' ');
     console.log(`[status ${new Date().toISOString().slice(11, 19)}] ${status}`);
   }, 300000);
 });
