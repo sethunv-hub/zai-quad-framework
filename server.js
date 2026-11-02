@@ -3,7 +3,7 @@
 // No dashboard. No browser. Just signals to your phone.
 
 const WebSocket = require('ws');
-const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias, detectSwings, updateZones, updateBias, isBinanceBanned, getBanMinutesLeft } = require('./smc-engine');
+const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias, detectSwings, updateZones, updateBias } = require('./smc-engine');
 
 // ===== CONFIGURATION =====
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
@@ -141,11 +141,9 @@ function connect(e) {
 
   ws.on('open', () => {
     console.log(`[${e.symbol}] ✓ Connected (live, kline stream)`);
-    // Try REST bootstrap only if c15 is empty AND not banned
-    if (e.c15.length === 0 && !isBinanceBanned()) {
+    // Try REST bootstrap only if c15 is empty
+    if (e.c15.length === 0) {
       bootstrap(e, offsetMap[e.symbol] || 0);
-    } else if (isBinanceBanned()) {
-      console.log(`[${e.symbol}] Skipping bootstrap — Binance banned for ${getBanMinutesLeft()}min`);
     }
   });
 
@@ -372,23 +370,20 @@ server.listen(PORT, HOST, () => {
   console.log(`========================================\n`);
 
   // Bootstrap all engines, then connect WebSockets
+  // STAGGER: 15 seconds between instruments to stay under TwelveData's 8 calls/min limit
+  // Each instrument makes 2 calls (15m + daily) = 8 total. With 15s gaps, that's ~1 min.
   (async () => {
     for (const e of engines) {
       await bootstrap(e, offsetMap[e.symbol] || 0);
       connect(e);
-      // Stagger connections to avoid hitting rate limits
-      await new Promise(r => setTimeout(r, 500));
+      // 15 second gap between instruments (TwelveData: 8 calls/min, we make 2 per instrument)
+      await new Promise(r => setTimeout(r, 15000));
     }
     console.log(`\n[${new Date().toISOString()}] All engines connected. Watching for signals...\n`);
   })();
 
   // Periodic maintenance every 5 min: refresh 1H + retry bootstrap if needed
-  // ALL paths check isBinanceBanned() first — never call Binance while banned
   setInterval(() => {
-    if (isBinanceBanned()) {
-      console.log(`[maintenance] Binance still banned for ${getBanMinutesLeft()}min — skipping all REST calls`);
-      return;
-    }
     engines.forEach(e => {
       refreshHtf(e, offsetMap[e.symbol] || 0);
       // Retry bootstrap if we don't have enough candles

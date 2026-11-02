@@ -60,66 +60,66 @@ function fmtPrice(symbol, n) {
   return '$' + n;
 }
 
-// ===== BAN PROTECTION (only infrastructure addition) =====
-let _binanceBannedUntil = 0;
-function isBinanceBanned() { return Date.now() < _binanceBannedUntil; }
-function getBanMinutesLeft() { return _binanceBannedUntil > Date.now() ? Math.ceil((_binanceBannedUntil - Date.now())/60000) : 0; }
+// ===== TWELVEDATA BOOTSTRAP (replaces Binance REST — no more IP bans) =====
+// TwelveData free tier: 800 calls/day, 8 calls/min. We use ~8 calls/day. Zero risk of ban.
+// IMPORTANT: 8 calls/min limit — must stagger fetches to avoid 429 errors.
+const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || '2577565126b44bf2bdff2d25e5f957f0';
+const TWELVEDATA_SYMBOLS = { BTC: 'BTC/USD', XAU: 'XAU/USD', XAG: 'XAG/USD', EUR: 'EUR/USD' };
 
-async function fetchKlines(base, sym, interval, limit) {
-  const r = await fetch(base + '?symbol=' + sym + '&interval=' + interval + '&limit=' + limit);
-  if (r.status === 418 || r.status === 429) {
-    _binanceBannedUntil = Date.now() + 7200000; // 2 hour cooldown — Binance bans are longer than 30min
-    throw new Error('Binance rate-limited (HTTP ' + r.status + ') — cooldown 30min');
+async function fetchTwelveData(tdSymbol, interval, outputsize) {
+  const url = `https://api.twelvedata.com/time_series?symbol=${tdSymbol}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVEDATA_KEY}`;
+  let retries = 3;
+  while (retries > 0) {
+    const r = await fetch(url);
+    if (r.status === 429) {
+      console.warn(`[TwelveData] Rate limited (429), waiting 60s... (${retries} retries left)`);
+      await new Promise(resolve => setTimeout(resolve, 60000)); // Wait 60s on rate limit
+      retries--;
+      continue;
+    }
+    if (!r.ok) throw new Error('TwelveData HTTP ' + r.status);
+    const data = await r.json();
+    if (data.status === 'error' || data.code === 429) throw new Error('TwelveData: ' + (data.message || 'rate limited'));
+    if (!data.values || !Array.isArray(data.values)) throw new Error('TwelveData: no values');
+    // TwelveData returns newest first — reverse to oldest first
+    return data.values.reverse().map(v => ({
+      t: new Date(v.datetime + 'Z').getTime(),
+      o: parseFloat(v.open), h: parseFloat(v.high),
+      l: parseFloat(v.low), c: parseFloat(v.close)
+    }));
   }
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  const data = await r.json();
-  if (!Array.isArray(data)) throw new Error('Non-array response: ' + JSON.stringify(data).slice(0, 100));
-  return data;
+  throw new Error('TwelveData: max retries exceeded');
 }
 
-// ===== Bootstrap (v2 logic + ban protection) =====
+// ===== Bootstrap (v2 logic + TwelveData — no Binance REST, no bans) =====
 async function bootstrap(e, offset) {
   if (e.c15.length >= 50) return;
-  if (isBinanceBanned()) { console.log(`[${e.symbol}] Bootstrap skipped — Binance banned for ${getBanMinutesLeft()}min`); return; }
   
-  const endpoints = e.config.futures
-    ? ['https://fapi.binance.com/fapi/v1/klines']
-    : ['https://api.binance.com/api/v3/klines', 'https://data-api.binance.vision/api/v3/klines'];
-  const sym = e.stream.toUpperCase();
-  
-  async function tryFetch(interval, limit) {
-    for (const ep of endpoints) {
-      try {
-        return await fetchKlines(ep, sym, interval, limit);
-      } catch (err) {
-        console.warn(`[${e.symbol}] ${interval} fetch from ${ep.split('//')[1].split('/')[0]} failed: ${err.message}`);
-      }
-    }
-    return null;
-  }
+  const tdSymbol = TWELVEDATA_SYMBOLS[e.symbol] || e.stream.toUpperCase();
+  console.log(`[${e.symbol}] Bootstrapping from TwelveData (${tdSymbol})...`);
   
   try {
-    const d15 = await tryFetch('15m', 100);
+    const d15 = await fetchTwelveData(tdSymbol, '15min', 100);
     if (d15 && d15.length > 0) {
       e.c15 = d15.map(k => ({
-        key: Math.floor(k[0]/60000/15),
-        o: parseFloat(k[1])+offset, h: parseFloat(k[2])+offset,
-        l: parseFloat(k[3])+offset, c: parseFloat(k[4])+offset,
-        t: new Date(k[0])
+        key: Math.floor(k.t/60000/15),
+        o: k.o+offset, h: k.h+offset,
+        l: k.l+offset, c: k.c+offset,
+        t: new Date(k.t)
       }));
-      console.log(`[${e.symbol}] Loaded ${e.c15.length} 15m candles`);
+      console.log(`[${e.symbol}] Loaded ${e.c15.length} 15m candles from TwelveData`);
     }
-  } catch (err) { console.warn(`[${e.symbol}] 15m bootstrap error:`, err.message); }
+  } catch (err) { console.warn(`[${e.symbol}] TwelveData 15m bootstrap failed:`, err.message); }
   
   try {
-    const d1d = await tryFetch('1d', 5);
+    const d1d = await fetchTwelveData(tdSymbol, '1day', 5);
     if (d1d && d1d.length >= 2) {
       const prev = d1d[d1d.length - 2];
-      e.pdh = parseFloat(prev[2])+offset;
-      e.pdl = parseFloat(prev[3])+offset;
+      e.pdh = prev.h + offset;
+      e.pdl = prev.l + offset;
       console.log(`[${e.symbol}] Loaded daily: PDH=${e.pdh}, PDL=${e.pdl}`);
     }
-  } catch (err) { console.warn(`[${e.symbol}] Daily bootstrap failed:`, err.message); }
+  } catch (err) { console.warn(`[${e.symbol}] TwelveData daily bootstrap failed:`, err.message); }
   
   if (e.c15.length > 0) {
     const last = e.c15[e.c15.length - 1];
@@ -623,7 +623,7 @@ function evaluate(e) {
   };
 }
 
-// Refresh 1H — kept simple (not used by v2 bias, but doesn't hurt)
+// Refresh — kept simple (not used by v2 bias, but doesn't hurt)
 async function refreshHtf(e, offset) {
   // v2 doesn't use 1H — this is a no-op
   return;
@@ -631,5 +631,5 @@ async function refreshHtf(e, offset) {
 
 module.exports = {
   makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend,
-  detectSwings, updateZones, updateBias, isBinanceBanned, getBanMinutesLeft
+  detectSwings, updateZones, updateBias
 };
