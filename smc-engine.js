@@ -55,7 +55,7 @@ function fmtPrice(symbol, n) {
   if (n == null) return '—';
   if (symbol === 'BTC') return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
   if (symbol === 'XAU') return '$' + n.toFixed(1);
-  if (symbol === 'XAG') return '$' + n.toFixed(2);
+  if (symbol === 'ETH') return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
   if (symbol === 'EUR') return '$' + n.toFixed(5);
   return '$' + n;
 }
@@ -64,7 +64,7 @@ function fmtPrice(symbol, n) {
 // TwelveData free tier: 800 calls/day, 8 calls/min. We use ~8 calls/day. Zero risk of ban.
 // IMPORTANT: 8 calls/min limit — must stagger fetches to avoid 429 errors.
 const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || '2577565126b44bf2bdff2d25e5f957f0';
-const TWELVEDATA_SYMBOLS = { BTC: 'BTC/USD', XAU: 'XAU/USD', XAG: 'XAG/USD', EUR: 'EUR/USD' };
+const TWELVEDATA_SYMBOLS = { BTC: 'BTC/USD', XAU: 'XAU/USD', EUR: 'EUR/USD', ETH: 'ETH/USD' };
 
 async function fetchTwelveData(tdSymbol, interval, outputsize) {
   const url = `https://api.twelvedata.com/time_series?symbol=${tdSymbol}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVEDATA_KEY}`;
@@ -562,7 +562,7 @@ function evaluate(e) {
   var rwp = e.config.riskWidePct || 0.008;
   if (zr > cp * rwp) return { action: 'WAIT', reason: 'Risk too wide' };
   // Min SL filter
-  var minSlPct = e.symbol === 'BTC' ? 0.003 : 0.002;
+  var minSlPct = (e.symbol === 'BTC' || e.symbol === 'ETH') ? 0.003 : 0.002;
   if (zr < cp * minSlPct) return { action: 'WAIT', reason: 'SL too tight (' + (zr / cp * 100).toFixed(2) + '%)' };
 
   // Targets — liquidity zones in trade direction

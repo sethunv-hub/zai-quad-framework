@@ -31,10 +31,10 @@ const engines = [
     roundStars: 1, riskWidePct: 0.008, breakoutTh: 0.0015, pullbackTh: 0.005,
     roundStep: 100, weekendSuppress: true, futures: false
   }),
-  makeEngine('XAG', 'xagusdt', {
-    prefix: 'silver', slBuffer: 0.05, minRisk: 0.10, maxRisk: 0.50,
-    roundStars: 2, riskWidePct: 0.015, breakoutTh: 0.003, pullbackTh: 0.007,
-    roundStep: 1, weekendSuppress: true, futures: true  // Silver only on Binance futures
+  makeEngine('ETH', 'ethusdt', {
+    prefix: 'eth', slBuffer: 25, minRisk: 75, maxRisk: 1500,
+    roundStars: 2, riskWidePct: 0.008, breakoutTh: 0.003, pullbackTh: 0.01,
+    roundStep: 500, weekendSuppress: false, futures: false
   }),
   makeEngine('EUR', 'eurusdt', {
     prefix: 'eur', slBuffer: 0.0008, minRisk: 0.0008, maxRisk: 0.0050,
@@ -66,7 +66,7 @@ async function sendNtfy(title, message) {
 
 // ===== SIGNAL HANDLER — fires when a valid signal passes all filters =====
 function onSignal(e, sig) {
-  const nameMap = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' };
+  const nameMap = { BTC: 'BTC', XAU: 'XAU', ETH: 'ETH', EUR: 'EUR' };
   const instShort = nameMap[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
@@ -80,7 +80,7 @@ function onSignal(e, sig) {
   const account = parseFloat(process.env.ACCOUNT_SIZE || '500');
   const riskPct = parseFloat(process.env.RISK_PCT || '0.5');
   const riskUsd = account * riskPct / 100;
-  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'XAU' ? 100 : e.symbol === 'XAG' ? 1000 : 100000;
+  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'ETH' ? 1 : e.symbol === 'XAU' ? 100 : 100000;
   const lotsRaw = riskUsd / (sig.zoneRisk * contractSize);
   const lots = Math.floor(lotsRaw * 100) / 100;
   
