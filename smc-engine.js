@@ -338,8 +338,8 @@ function updateBias(e) {
     var l4 = c.slice(-4);
     bC = l4.filter(function(x) { return x.c < x.o; }).length;
     buC = l4.filter(function(x) { return x.c > x.o; }).length;
-    if (bC === 4) { mb = 'bearish'; mn = ' (4-bear)'; }
-    else if (buC === 4) { mb = 'bullish'; mn = ' (4-bull)'; }
+    if (bC >= 3) { mb = 'bearish'; mn = ' (3-bear)'; }
+    else if (buC >= 3) { mb = 'bullish'; mn = ' (3-bull)'; }
   }
   if (c.length >= 10 && mb === 'neutral') {
     var l10 = c.slice(-10);
@@ -453,6 +453,82 @@ function scanSig(e, minGrade, onSignal) {
 
 // ===== v2 evaluate (exact copy from index.html) =====
 function evaluate(e) {
+  // ===== ZONE REJECTION ENTRY (NEW — fires WITHOUT bias requirement) =====
+  // This mimics live traders: price hits major zone → rejection wick → enter
+  // No bias needed, no sweep needed — the rejection IS the signal
+  if (e.c15.length >= 5 && e.zones.length > 0) {
+    var zrCp = e.price;
+    var zrLc = e.c15[e.c15.length - 1];
+    var zrBody = Math.abs(zrLc.c - zrLc.o);
+    var zrRange = zrLc.h - zrLc.l;
+    var zrMajTypes = ['pdh', 'pdl', 'eqh', 'eql', 'session_high', 'session_low'];
+    var zrMajZones = e.zones.filter(function(z) { return zrMajTypes.indexOf(z.type) >= 0 && !z.swept; });
+    
+    for (var zi = 0; zi < zrMajZones.length; zi++) {
+      var zrZone = zrMajZones[zi];
+      var zrDist = Math.abs(zrZone.level - zrCp) / zrCp;
+      if (zrDist > 0.002) continue; // price must be within 0.2% of zone
+      if (zrRange === 0) continue;
+      
+      var zrDir = null;
+      // Bullish rejection at support zone (wick below, close above)
+      if ((zrZone.type.indexOf('low') >= 0 || zrZone.type === 'pdl' || zrZone.type === 'eql')
+          && zrLc.l <= zrZone.level + zrCp * 0.001 && zrLc.c > zrZone.level
+          && (Math.min(zrLc.o, zrLc.c) - zrLc.l) > zrBody * 1.5 && zrLc.c > zrLc.o) {
+        zrDir = 'bullish';
+      }
+      // Bearish rejection at resistance zone (wick above, close below)
+      if ((zrZone.type.indexOf('high') >= 0 || zrZone.type === 'pdh' || zrZone.type === 'eqh')
+          && zrLc.h >= zrZone.level - zrCp * 0.001 && zrLc.c < zrZone.level
+          && (zrLc.h - Math.max(zrLc.o, zrLc.c)) > zrBody * 1.5 && zrLc.c < zrLc.o) {
+        zrDir = 'bearish';
+      }
+      
+      if (zrDir) {
+        var zrEntry = zrCp;
+        var zrSL = zrDir === 'bullish' ? zrZone.level - e.config.slBuffer : zrZone.level + e.config.slBuffer;
+        var zrRisk = Math.abs(zrEntry - zrSL);
+        // Validate
+        if ((zrDir === 'bullish' && zrSL >= zrEntry) || (zrDir === 'bearish' && zrSL <= zrEntry)) continue;
+        if (zrRisk > zrCp * (e.config.riskWidePct || 0.008)) continue;
+        var zrMinSl = (e.symbol === 'BTC' || e.symbol === 'ETH') ? 0.003 : 0.002;
+        if (zrRisk < zrCp * zrMinSl) continue;
+        if (zrRisk < e.config.minRisk || zrRisk > e.config.maxRisk) continue;
+        // TP — cap at 2R max
+        var zrInDir = e.zones.filter(function(z) {
+          return !z.swept && z !== zrZone &&
+            (zrDir === 'bullish' ? (z.level > zrEntry + zrEntry * 0.001) : (z.level < zrEntry - zrEntry * 0.001));
+        }).sort(function(a, b) { return zrDir === 'bullish' ? a.level - b.level : b.level - a.level; });
+        var zrTP1, zrTP2 = null, zrTP3 = null;
+        if (zrInDir.length > 0) {
+          zrTP1 = zrInDir.find(function(z) { return Math.abs(z.level - zrEntry) >= zrRisk; }) || zrInDir[0];
+          if (Math.abs(zrTP1.level - zrEntry) / zrRisk > 2.0) {
+            zrTP1 = { level: zrDir === 'bullish' ? zrEntry + zrRisk * 2 : zrEntry - zrRisk * 2, type: '2R', name: '2R Target' };
+          }
+          var zrMs2 = zrCp * 0.001;
+          var zrFurther = zrInDir.filter(function(z) { return z !== zrTP1 && Math.abs(z.level - zrTP1.level) > zrMs2; });
+          zrTP2 = zrFurther[0] || null;
+          zrTP3 = zrFurther[1] || null;
+        } else {
+          zrTP1 = { level: zrDir === 'bullish' ? zrEntry + zrRisk * 2 : zrEntry - zrRisk * 2, type: '2R', name: '2R Target' };
+        }
+        var zrRR1 = zrRisk > 0 ? Math.abs(zrTP1.level - zrEntry) / zrRisk : 0;
+        var zrIsStruct = zrTP1.type && zrTP1.type !== 'round' && zrTP1.type !== '2R';
+        return {
+          action: zrDir === 'bullish' ? 'LONG' : 'SHORT',
+          quality: zrIsStruct ? 'B' : 'C', entryType: 'rejection',
+          confidence: 3 + (isSessWin() ? 1 : 0),
+          entry: zrEntry, sl: zrSL,
+          tp1: zrTP1.level, tp2: zrTP2 ? zrTP2.level : null, tp3: zrTP3 ? zrTP3.level : null,
+          zoneRisk: zrRisk, rr1: zrRR1,
+          sweep: { level: zrZone.level, name: zrZone.name + ' rejection', type: zrZone.type, time: new Date() },
+          trigger: 'Zone rejection (' + zrDir + ')', confluence: zrZone.name
+        };
+      }
+    }
+  }
+
+  // ===== EXISTING SMC LOGIC (secondary — requires bias) =====
   // Breakout check first (per-instrument threshold)
   if (e.c15.length >= 3) {
     var c2 = e.c15, l3 = c2.slice(-3);
@@ -475,7 +551,8 @@ function evaluate(e) {
   var bias = e.bias;
   if (bias === 'neutral') return { action: 'WAIT', reason: 'No bias — waiting for trend or breakout' };
 
-  var recent = e.swept.filter(function(s) { return (new Date() - s.time) < 1800000; });
+  // 60-minute sweep window (was 30 min)
+  var recent = e.swept.filter(function(s) { return (new Date() - s.time) < 3600000; });
   var sweep = null;
   var cp = e.price;
   var majT = ['session_high', 'session_low', 'pdh', 'pdl', 'eqh', 'eql'];
@@ -591,7 +668,8 @@ function evaluate(e) {
     var tp1C = inDir.filter(function(z) { return Math.abs(z.level - entry) >= minTP1R; });
     tp1 = tp1C[0] || inDir[0];
     var tp1R = Math.abs(tp1.level - entry) / zr;
-    if (tp1R > 3.0) return { action: 'WAIT', reason: 'TP1 too far (' + tp1R.toFixed(1) + 'R) — entry too late' };
+    // Cap TP1 at 2R — if nearest zone > 2R, use 2R as target (don't reject)
+    if (tp1R > 2.0) { tp1 = { level: bias === 'bullish' ? entry + zr * 2 : entry - zr * 2, stars: 1, name: '2R Target' }; tp1R = 2.0; }
     var ms2 = cp * 0.001;
     var isLng = bias === 'bullish';
     var further = inDir.filter(function(z) { return z !== tp1 && (isLng ? (z.level > tp1.level + ms2) : (z.level < tp1.level - ms2)); });
