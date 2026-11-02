@@ -68,7 +68,7 @@ function getBanMinutesLeft() { return _binanceBannedUntil > Date.now() ? Math.ce
 async function fetchKlines(base, sym, interval, limit) {
   const r = await fetch(base + '?symbol=' + sym + '&interval=' + interval + '&limit=' + limit);
   if (r.status === 418 || r.status === 429) {
-    _binanceBannedUntil = Date.now() + 1800000; // 30 min cooldown
+    _binanceBannedUntil = Date.now() + 7200000; // 2 hour cooldown — Binance bans are longer than 30min
     throw new Error('Binance rate-limited (HTTP ' + r.status + ') — cooldown 30min');
   }
   if (!r.ok) throw new Error('HTTP ' + r.status);
