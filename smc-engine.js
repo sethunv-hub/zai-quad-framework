@@ -124,7 +124,8 @@ async function bootstrap(e, offset) {
   if (e.c15.length > 0) {
     const last = e.c15[e.c15.length - 1];
     e.cb = [{ minuteKey: Math.floor(Date.now()/60000), o: last.c, h: last.c, l: last.c, c: last.c, t: new Date() }];
-    bootSess(e); bootPD(e); detectSwings(e); updateZones(e); updateBias(e);
+    bootSess(e); detectSwings(e); updateZones(e); updateBias(e);
+    // NOTE: Don't call bootPD() — it overwrites the correct TwelveData PDH/PDL with wrong 15m-based values
     if (e.price == null) handlePrice(e, last.c, offset);
     console.log(`[${e.symbol}] Bootstrap complete: ${e.c15.length} candles, bias=${e.bias}, price=${fmtPrice(e.symbol, last.c)}`);
   } else {
@@ -220,11 +221,8 @@ function updateSess(e, p) {
   if (se.h == null) se.h = p;
   if (se.l == null) se.l = p;
   se.h = Math.max(se.h, p); se.l = Math.min(se.l, p);
-  if (gH() === 0) {
-    e.pdh = Math.max(e.ses.asian.h || 0, e.ses.london.h || 0, e.ses.ny.h || 0);
-    e.pdl = Math.min(e.ses.asian.l || 9e9, e.ses.london.l || 9e9, e.ses.ny.l || 9e9);
-    e.ses = { asian: { h: null, l: null }, london: { h: null, l: null }, ny: { h: null, l: null } };
-  }
+  // BUG FIX: This was overwriting TwelveData PDH/PDL with session-based values at UTC midnight
+  // Removed — PDH/PDL now come from TwelveData daily candles (set in bootstrap)
 }
 
 function updateZones(e) {
@@ -397,6 +395,7 @@ function scanSig(e, minGrade, onSignal) {
   }
   if (e.actSig && now < e.lockUntil) {
     e.signal = e.actSig; e.signal.currentPrice = e.price;
+    if (!e.signal.reason) e.signal.reason = (e.signal.trigger || 'Active') + ' • ' + (e.signal.sweep ? e.signal.sweep.name : '');
     return;
   }
   // Graduated cooldown by last signal grade
@@ -453,82 +452,10 @@ function scanSig(e, minGrade, onSignal) {
 
 // ===== v2 evaluate (exact copy from index.html) =====
 function evaluate(e) {
-  // ===== ZONE REJECTION ENTRY (NEW — fires WITHOUT bias requirement) =====
-  // This mimics live traders: price hits major zone → rejection wick → enter
-  // No bias needed, no sweep needed — the rejection IS the signal
-  if (e.c15.length >= 5 && e.zones.length > 0) {
-    var zrCp = e.price;
-    var zrLc = e.c15[e.c15.length - 1];
-    var zrBody = Math.abs(zrLc.c - zrLc.o);
-    var zrRange = zrLc.h - zrLc.l;
-    var zrMajTypes = ['pdh', 'pdl', 'eqh', 'eql', 'session_high', 'session_low'];
-    var zrMajZones = e.zones.filter(function(z) { return zrMajTypes.indexOf(z.type) >= 0 && !z.swept; });
-    
-    for (var zi = 0; zi < zrMajZones.length; zi++) {
-      var zrZone = zrMajZones[zi];
-      var zrDist = Math.abs(zrZone.level - zrCp) / zrCp;
-      if (zrDist > 0.002) continue; // price must be within 0.2% of zone
-      if (zrRange === 0) continue;
-      
-      var zrDir = null;
-      // Bullish rejection at support zone (wick below, close above)
-      if ((zrZone.type.indexOf('low') >= 0 || zrZone.type === 'pdl' || zrZone.type === 'eql')
-          && zrLc.l <= zrZone.level + zrCp * 0.001 && zrLc.c > zrZone.level
-          && (Math.min(zrLc.o, zrLc.c) - zrLc.l) > zrBody * 1.5 && zrLc.c > zrLc.o) {
-        zrDir = 'bullish';
-      }
-      // Bearish rejection at resistance zone (wick above, close below)
-      if ((zrZone.type.indexOf('high') >= 0 || zrZone.type === 'pdh' || zrZone.type === 'eqh')
-          && zrLc.h >= zrZone.level - zrCp * 0.001 && zrLc.c < zrZone.level
-          && (zrLc.h - Math.max(zrLc.o, zrLc.c)) > zrBody * 1.5 && zrLc.c < zrLc.o) {
-        zrDir = 'bearish';
-      }
-      
-      if (zrDir) {
-        var zrEntry = zrCp;
-        var zrSL = zrDir === 'bullish' ? zrZone.level - e.config.slBuffer : zrZone.level + e.config.slBuffer;
-        var zrRisk = Math.abs(zrEntry - zrSL);
-        // Validate
-        if ((zrDir === 'bullish' && zrSL >= zrEntry) || (zrDir === 'bearish' && zrSL <= zrEntry)) continue;
-        if (zrRisk > zrCp * (e.config.riskWidePct || 0.008)) continue;
-        var zrMinSl = (e.symbol === 'BTC' || e.symbol === 'ETH') ? 0.003 : 0.002;
-        if (zrRisk < zrCp * zrMinSl) continue;
-        if (zrRisk < e.config.minRisk || zrRisk > e.config.maxRisk) continue;
-        // TP — cap at 2R max
-        var zrInDir = e.zones.filter(function(z) {
-          return !z.swept && z !== zrZone &&
-            (zrDir === 'bullish' ? (z.level > zrEntry + zrEntry * 0.001) : (z.level < zrEntry - zrEntry * 0.001));
-        }).sort(function(a, b) { return zrDir === 'bullish' ? a.level - b.level : b.level - a.level; });
-        var zrTP1, zrTP2 = null, zrTP3 = null;
-        if (zrInDir.length > 0) {
-          zrTP1 = zrInDir.find(function(z) { return Math.abs(z.level - zrEntry) >= zrRisk; }) || zrInDir[0];
-          if (Math.abs(zrTP1.level - zrEntry) / zrRisk > 2.0) {
-            zrTP1 = { level: zrDir === 'bullish' ? zrEntry + zrRisk * 2 : zrEntry - zrRisk * 2, type: '2R', name: '2R Target' };
-          }
-          var zrMs2 = zrCp * 0.001;
-          var zrFurther = zrInDir.filter(function(z) { return z !== zrTP1 && Math.abs(z.level - zrTP1.level) > zrMs2; });
-          zrTP2 = zrFurther[0] || null;
-          zrTP3 = zrFurther[1] || null;
-        } else {
-          zrTP1 = { level: zrDir === 'bullish' ? zrEntry + zrRisk * 2 : zrEntry - zrRisk * 2, type: '2R', name: '2R Target' };
-        }
-        var zrRR1 = zrRisk > 0 ? Math.abs(zrTP1.level - zrEntry) / zrRisk : 0;
-        var zrIsStruct = zrTP1.type && zrTP1.type !== 'round' && zrTP1.type !== '2R';
-        return {
-          action: zrDir === 'bullish' ? 'LONG' : 'SHORT',
-          quality: zrIsStruct ? 'B' : 'C', entryType: 'rejection',
-          confidence: 3 + (isSessWin() ? 1 : 0),
-          entry: zrEntry, sl: zrSL,
-          tp1: zrTP1.level, tp2: zrTP2 ? zrTP2.level : null, tp3: zrTP3 ? zrTP3.level : null,
-          zoneRisk: zrRisk, rr1: zrRR1,
-          sweep: { level: zrZone.level, name: zrZone.name + ' rejection', type: zrZone.type, time: new Date() },
-          trigger: 'Zone rejection (' + zrDir + ')', confluence: zrZone.name
-        };
-      }
-    }
-  }
+  // ===== ZONE REJECTION REMOVED — user tested Vinbull's strategy manually, all trades failed =====
+  // Keeping our proven v2 SMC logic only. Do not re-add without real backtesting.
 
-  // ===== EXISTING SMC LOGIC (secondary — requires bias) =====
+  // ===== EXISTING SMC LOGIC (proven v2 — requires bias) =====
   // Breakout check first (per-instrument threshold)
   if (e.c15.length >= 3) {
     var c2 = e.c15, l3 = c2.slice(-3);
@@ -696,8 +623,9 @@ function evaluate(e) {
     confidence: (trigger ? 2 : 0) + (confl ? 2 : 0) + (isSessWin() ? 1 : 0) + (quality === 'A' ? 1 : 0),
     entry: entry, sl: sl,
     tp1: tp1.level, tp2: tp2 ? tp2.level : null, tp3: tp3 ? tp3.level : null,
-    zoneRisk: zr, rr1: rr1,
-    sweep: sweep, trigger: trigger, confluence: conflDesc
+    zoneRisk: zr, rr1: rr1, rr2: 0, rr3: 0,
+    sweep: sweep, trigger: trigger, confluence: conflDesc,
+    reason: (trigger || 'Confluence') + ' at ' + sweep.name + ' • TP1 ' + rr1.toFixed(1) + 'R'
   };
 }
 
