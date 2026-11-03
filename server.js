@@ -51,14 +51,21 @@ const offsetMap = {
 // ===== ntfy PUSH =====
 async function sendNtfy(title, message) {
   try {
-    const params = new URLSearchParams({
-      message, title, priority: 'urgent', tags: 'chart_with_upwards_trend'
+    const url = `https://ntfy.sh/${encodeURIComponent(CONFIG.ntfyTopic)}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Title': title,
+        'Priority': 'urgent',
+        'Tags': 'chart_with_upwards_trend'
+      },
+      body: message
     });
-    await fetch(`https://ntfy.sh/${encodeURIComponent(CONFIG.ntfyTopic)}/publish?${params.toString()}`, {
-      method: 'GET',
-      mode: 'no-cors'
-    });
-    console.log(`[ntfy] Pushed: ${title}`);
+    if (res.ok) {
+      console.log(`[ntfy] Pushed: ${title}`);
+    } else {
+      console.error(`[ntfy] HTTP ${res.status}: ${await res.text()}`);
+    }
   } catch (e) {
     console.error(`[ntfy] Push failed:`, e.message);
   }
