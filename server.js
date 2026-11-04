@@ -52,6 +52,8 @@ const offsetMap = {
 async function sendNtfy(title, message) {
   try {
     const url = `https://ntfy.sh/${encodeURIComponent(CONFIG.ntfyTopic)}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -59,15 +61,18 @@ async function sendNtfy(title, message) {
         'Priority': 'urgent',
         'Tags': 'chart_with_upwards_trend'
       },
-      body: message
+      body: message,
+      signal: controller.signal
     });
+    clearTimeout(timeout);
     if (res.ok) {
       console.log(`[ntfy] Pushed: ${title}`);
     } else {
-      console.error(`[ntfy] HTTP ${res.status}: ${await res.text()}`);
+      const errBody = await res.text();
+      console.error(`[ntfy] HTTP ${res.status}: ${errBody.slice(0, 100)}`);
     }
   } catch (e) {
-    console.error(`[ntfy] Push failed:`, e.message);
+    console.error(`[ntfy] Push failed: ${e.name} - ${e.message}`);
   }
 }
 
@@ -360,8 +365,42 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Test ntfy endpoint — sends a test notification and shows the result
+  if (req.url === '/test-ntfy') {
+    try {
+      const url = `https://ntfy.sh/${encodeURIComponent(CONFIG.ntfyTopic)}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      const res2 = await fetch(url, {
+        method: 'POST',
+        headers: { 'Title': '🧪 ZAI ntfy Test', 'Priority': 'urgent', 'Tags': 'test_tube' },
+        body: 'Test notification from ZAI QUAD FRAMEWORK cloud server. If you received this, ntfy is working!',
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      const body = await res2.text();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        ok: res2.ok, 
+        status: res2.status, 
+        topic: CONFIG.ntfyTopic,
+        url: url,
+        response: body.slice(0, 200)
+      }, null, 2));
+    } catch (err) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        ok: false, 
+        error: err.message, 
+        name: err.name,
+        topic: CONFIG.ntfyTopic
+      }, null, 2));
+    }
+    return;
+  }
+
   res.writeHead(404);
-  res.end('Not found. Use /health, /journal, /journal.csv, or /offset/SYMBOL/VALUE');
+  res.end('Not found. Use /health, /debug, /journal, /test-ntfy, or /offset/SYMBOL/VALUE');
 });
 
 const PORT = process.env.PORT || 8080;
