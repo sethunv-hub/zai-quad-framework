@@ -49,15 +49,19 @@ const offsetMap = {
 };
 
 // ===== ntfy PUSH =====
+// IMPORTANT: HTTP headers must be ASCII — NO emojis in Title header
+// Emojis go in the message body, not headers
 async function sendNtfy(title, message) {
   try {
     const url = `https://ntfy.sh/${encodeURIComponent(CONFIG.ntfyTopic)}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
+    // Strip any non-ASCII characters from title (emojis crash Node.js headers)
+    const cleanTitle = title.replace(/[^\x20-\x7E]/g, '');
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        'Title': title,
+        'Title': cleanTitle,
         'Priority': 'urgent',
         'Tags': 'chart_with_upwards_trend'
       },
@@ -66,7 +70,7 @@ async function sendNtfy(title, message) {
     });
     clearTimeout(timeout);
     if (res.ok) {
-      console.log(`[ntfy] Pushed: ${title}`);
+      console.log(`[ntfy] Pushed: ${cleanTitle}`);
     } else {
       const errBody = await res.text();
       console.error(`[ntfy] HTTP ${res.status}: ${errBody.slice(0, 100)}`);
@@ -373,7 +377,7 @@ const server = http.createServer(async (req, res) => {
       const timeout = setTimeout(() => controller.abort(), 10000);
       const res2 = await fetch(url, {
         method: 'POST',
-        headers: { 'Title': '🧪 ZAI ntfy Test', 'Priority': 'urgent', 'Tags': 'test_tube' },
+        headers: { 'Title': 'ZAI ntfy Test', 'Priority': 'urgent', 'Tags': 'test_tube' },
         body: 'Test notification from ZAI QUAD FRAMEWORK cloud server. If you received this, ntfy is working!',
         signal: controller.signal
       });
