@@ -1,5 +1,5 @@
 // server.js — ZAI QUAD FRAMEWORK cloud server
-// Runs 24/7 on Fly.io. Connects to Binance WebSockets, evaluates SMC signals, pushes ntfy alerts.
+// Runs 24/7 on Render. Connects to Binance WebSockets, evaluates SMC signals, pushes Telegram alerts.
 // No dashboard. No browser. Just signals to your phone.
 
 const WebSocket = require('ws');
@@ -8,7 +8,8 @@ const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPric
 // ===== CONFIGURATION =====
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
 const CONFIG = {
-  ntfyTopic: process.env.NTFY_TOPIC || 'sethu-btc',
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '9149020873:AAGiPgSRSWBThcu0lJERnQQvVEVLNaNR2io',
+  telegramChatId: process.env.TELEGRAM_CHAT_ID || '8855264786',
   minGrade: process.env.MIN_GRADE || 'A',          // A, AB, or ABC
   // Per-instrument Exness offsets — set via env vars or fetch from a config endpoint
   btcOffset: parseFloat(process.env.BTC_OFFSET || '0'),
@@ -48,35 +49,32 @@ const offsetMap = {
   XAG: CONFIG.silverOffset, EUR: CONFIG.eurOffset
 };
 
-// ===== ntfy PUSH =====
-// IMPORTANT: HTTP headers must be ASCII — NO emojis in Title header
-// Emojis go in the message body, not headers
+// ===== TELEGRAM PUSH =====
+// Unlimited messages, no daily quota, instant delivery
 async function sendNtfy(title, message) {
   try {
-    const url = `https://ntfy.sh/${encodeURIComponent(CONFIG.ntfyTopic)}`;
+    const url = `https://api.telegram.org/bot${CONFIG.telegramBotToken}/sendMessage`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
-    // Strip any non-ASCII characters from title (emojis crash Node.js headers)
-    const cleanTitle = title.replace(/[^\x20-\x7E]/g, '');
+    const fullMessage = `${title}\n\n${message}`;
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Title': cleanTitle,
-        'Priority': 'urgent',
-        'Tags': 'chart_with_upwards_trend'
-      },
-      body: message,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: CONFIG.telegramChatId,
+        text: fullMessage
+      }),
       signal: controller.signal
     });
     clearTimeout(timeout);
     if (res.ok) {
-      console.log(`[ntfy] Pushed: ${cleanTitle}`);
+      console.log(`[Telegram] Pushed: ${title}`);
     } else {
       const errBody = await res.text();
-      console.error(`[ntfy] HTTP ${res.status}: ${errBody.slice(0, 100)}`);
+      console.error(`[Telegram] HTTP ${res.status}: ${errBody.slice(0, 100)}`);
     }
   } catch (e) {
-    console.error(`[ntfy] Push failed: ${e.name} - ${e.message}`);
+    console.error(`[Telegram] Push failed: ${e.name} - ${e.message}`);
   }
 }
 
@@ -369,16 +367,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Test ntfy endpoint — sends a test notification and shows the result
-  if (req.url === '/test-ntfy') {
+  // Test Telegram endpoint — sends a test notification and shows the result
+  if (req.url === '/test-ntfy' || req.url === '/test-telegram') {
     try {
-      const url = `https://ntfy.sh/${encodeURIComponent(CONFIG.ntfyTopic)}`;
+      const url = `https://api.telegram.org/bot${CONFIG.telegramBotToken}/sendMessage`;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
       const res2 = await fetch(url, {
         method: 'POST',
-        headers: { 'Title': 'ZAI ntfy Test', 'Priority': 'urgent', 'Tags': 'test_tube' },
-        body: 'Test notification from ZAI QUAD FRAMEWORK cloud server. If you received this, ntfy is working!',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: CONFIG.telegramChatId,
+          text: '🧪 ZAI QUAD FRAMEWORK\n\nTelegram notifications are working!\n\nYou will receive trading signals here.'
+        }),
         signal: controller.signal
       });
       clearTimeout(timeout);
@@ -387,8 +388,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ 
         ok: res2.ok, 
         status: res2.status, 
-        topic: CONFIG.ntfyTopic,
-        url: url,
+        chatId: CONFIG.telegramChatId,
         response: body.slice(0, 200)
       }, null, 2));
     } catch (err) {
@@ -397,14 +397,14 @@ const server = http.createServer(async (req, res) => {
         ok: false, 
         error: err.message, 
         name: err.name,
-        topic: CONFIG.ntfyTopic
+        chatId: CONFIG.telegramChatId
       }, null, 2));
     }
     return;
   }
 
   res.writeHead(404);
-  res.end('Not found. Use /health, /debug, /journal, /test-ntfy, or /offset/SYMBOL/VALUE');
+  res.end('Not found. Use /health, /debug, /journal, /test-telegram, or /offset/SYMBOL/VALUE');
 });
 
 const PORT = process.env.PORT || 8080;
@@ -414,7 +414,7 @@ server.listen(PORT, HOST, () => {
   console.log(`  ZAI QUAD FRAMEWORK — Cloud Server`);
   console.log(`========================================`);
   console.log(`HTTP:  http://${HOST}:${PORT}/health`);
-  console.log(`ntfy:  ${CONFIG.ntfyTopic}`);
+  console.log(`Telegram: Chat ID ${CONFIG.telegramChatId}`);
   console.log(`Grade: ${CONFIG.minGrade}-only filter`);
   console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}, XAG=${offsetMap.XAG}, EUR=${offsetMap.EUR}`);
   console.log(`========================================\n`);
