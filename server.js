@@ -120,7 +120,7 @@ async function onSignal(e, sig) {
   const instShort = nameMap[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
-  const title = `${emoji} ZAI ${instShort} ${dir} [${sig.quality} ${sig.score}/9]`;
+  const title = `${emoji} [V2] ZAI ${instShort} ${dir} [${sig.quality} ${sig.score}/9]`;
   const phtStr = fmtPht(Date.now());
   
   // Build checklist summary (which checks passed)
