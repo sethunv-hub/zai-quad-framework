@@ -81,7 +81,7 @@ async function sendNtfy(title, message) {
 }
 
 // ===== SIGNAL HANDLER — fires when a valid signal passes all filters =====
-function onSignal(e, sig) {
+async function onSignal(e, sig) {
   const nameMap = { BTC: 'BTC', XAU: 'XAU', ETH: 'ETH', EUR: 'EUR' };
   const instShort = nameMap[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
@@ -111,7 +111,7 @@ Risk: $${riskUsd.toFixed(0)} → ${lots} lots`;
   console.log(`\n[${new Date().toISOString()}] ${title}`);
   console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
 
-  sendNtfy(title, msg);
+  await sendNtfy(title, msg);
 
   // Log to journal
   journal.push({
