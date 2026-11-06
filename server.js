@@ -5,11 +5,37 @@
 const WebSocket = require('ws');
 const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias, detectSwings, updateZones, updateBias } = require('./smc-engine');
 
+// ===== SNIPER ENGINE (Engine B) — runs in parallel, ISOLATED from V2 =====
+// This is the EXACT logic from smc-signals-mobile.html (4/4 bias, 30-min sweep lookback)
+// Instruments: BTC + XAU only (per user request — matches SMC Sniper HTML)
+// Push prefix: [SNIPER] in Telegram messages
+const SniperEngine = require('./smc-engine-sniper');
+const sniperEngines = [
+  SniperEngine.makeSniperEngine('BTC', 'btcusdt', {
+    slBuffer: 50, minRisk: 150, maxRisk: 3000
+  }),
+  SniperEngine.makeSniperEngine('XAU', 'paxgusdt', {
+    slBuffer: 2.5, minRisk: 6, maxRisk: 30
+  })
+];
+// Map for quick lookup by symbol — used to mirror ticks from V2's WebSocket into Sniper engines
+const sniperBySymbol = {};
+sniperEngines.forEach(e => { sniperBySymbol[e.symbol] = e; });
+let sniperBootstrapped = false;
+
 // ===== CONFIGURATION =====
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
 const CONFIG = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '9149020873:AAGiPgSRSWBThcu0lJERnQQvVEVLNaNR2io',
-  telegramChatId: process.env.TELEGRAM_CHAT_ID || '8855264786',
+  // Comma-separated list of chat IDs - all will receive every signal
+  // To add a recipient: have them start @ZaiQuadBot, get their ID from @userinfobot,
+  // then add it here (comma-separated) or set TELEGRAM_CHAT_IDS env var
+  telegramChatIds: (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || '8855264786')
+    .split(',')
+    .map(id => id.trim())
+    .filter(id => id.length > 0),
+  // Legacy single chat ID kept for backwards compatibility
+  get telegramChatId() { return this.telegramChatIds[0]; },
   minGrade: process.env.MIN_GRADE || 'A',          // A, AB, or ABC
   // Per-instrument Exness offsets — set via env vars or fetch from a config endpoint
   btcOffset: parseFloat(process.env.BTC_OFFSET || '0'),
@@ -52,29 +78,39 @@ const offsetMap = {
 // ===== TELEGRAM PUSH =====
 // Unlimited messages, no daily quota, instant delivery
 async function sendNtfy(title, message) {
+  const fullMessage = `${title}\n\n${message}`;
+  // Send to every chat ID in the list (wife, you, anyone else added later)
+  const results = await Promise.allSettled(
+    CONFIG.telegramChatIds.map(chatId => sendToChat(chatId, fullMessage))
+  );
+  let ok = 0, fail = 0;
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled' && r.value === true) ok++;
+    else {
+      fail++;
+      console.error(`[Telegram] Failed for chat ${CONFIG.telegramChatIds[i]}:`,
+        r.status === 'rejected' ? r.reason : 'unknown');
+    }
+  });
+  console.log(`[Telegram] Pushed "${title}" to ${ok}/${CONFIG.telegramChatIds.length} recipients`);
+}
+
+async function sendToChat(chatId, text) {
   try {
     const url = `https://api.telegram.org/bot${CONFIG.telegramBotToken}/sendMessage`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
-    const fullMessage = `${title}\n\n${message}`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: CONFIG.telegramChatId,
-        text: fullMessage
-      }),
+      body: JSON.stringify({ chat_id: chatId, text }),
       signal: controller.signal
     });
     clearTimeout(timeout);
-    if (res.ok) {
-      console.log(`[Telegram] Pushed: ${title}`);
-    } else {
-      const errBody = await res.text();
-      console.error(`[Telegram] HTTP ${res.status}: ${errBody.slice(0, 100)}`);
-    }
+    return res.ok;
   } catch (e) {
-    console.error(`[Telegram] Push failed: ${e.name} - ${e.message}`);
+    console.error(`[Telegram] Push to ${chatId} failed: ${e.name} - ${e.message}`);
+    return false;
   }
 }
 
@@ -141,6 +177,43 @@ function curSessName() {
   return null;
 }
 
+// ===== SNIPER SIGNAL HANDLER (Engine B) — pushes to Telegram with [SNIPER] prefix =====
+// ISOLATED from V2's onSignal. Separate function, separate state, separate prefix.
+async function onSniperSignal(e, sig) {
+  const instShort = e.symbol === 'BTC' ? 'BTC' : 'XAU';
+  const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
+  const emoji = sig.action === 'LONG' ? '📈' : '📉';
+  // [SNIPER] prefix distinguishes these signals from V2's [V2] signals
+  const title = `${emoji} [SNIPER] ZAI ${instShort} ${dir} — ${sig.quality} • ${sig.confidence}/5`;
+  const phtStr = SniperEngine.fmtPht(Date.now());
+
+  const msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)}
+SL: ${SniperEngine.fmtPrice(e.symbol, sig.sl)}
+TP1: ${SniperEngine.fmtPrice(e.symbol, sig.tp1)} (${sig.rr1.toFixed(1)}R)${sig.tp2 ? ' | TP2: ' + SniperEngine.fmtPrice(e.symbol, sig.tp2) + ' (' + sig.rr2.toFixed(1) + 'R)' : ''}${sig.tp3 ? ' | TP3: ' + SniperEngine.fmtPrice(e.symbol, sig.tp3) + ' (' + sig.rr3.toFixed(1) + 'R)' : ''}
+Trigger: ${sig.trigger || '—'} | Sweep: ${sig.sweep.name}
+Bias: ${e.bias} | Type: ${(sig.entryType || 'smc').toUpperCase()} | Time: ${phtStr}
+Risk: ${SniperEngine.fmtPrice(e.symbol, sig.zoneRisk)}`;
+
+  console.log(`\n[${new Date().toISOString()}] ${title}`);
+  console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
+
+  // Push to Telegram (same channel as V2, but with [SNIPER] prefix to distinguish)
+  await sendNtfy(title, msg);
+
+  // Log to separate sniper journal (kept separate from V2's journal)
+  sniperJournal.push({
+    timestamp: new Date().toISOString(),
+    instrument: e.symbol, action: sig.action, grade: sig.quality,
+    entry: sig.entry, sl: sig.sl,
+    tp1: sig.tp1, tp2: sig.tp2, tp3: sig.tp3,
+    zoneRisk: sig.zoneRisk, rr1: sig.rr1, rr2: sig.rr2, rr3: sig.rr3,
+    sweep: sig.sweep.name, trigger: sig.trigger, entryType: sig.entryType,
+    bias: e.bias, session: SniperEngine.curSess(), outcome: 'pending'
+  });
+  if (sniperJournal.length > 200) sniperJournal.shift();
+}
+const sniperJournal = [];
+
 // ===== WEBSOCKET CONNECTIONS — use kline stream for candle data =====
 const sockets = {};
 
@@ -169,6 +242,25 @@ function connect(e) {
         const k = d.k;
         const offset = offsetMap[e.symbol] || 0;
         const price = parseFloat(k.c) + offset; // current price from candle close
+
+        // === MIRROR TICK TO SNIPER ENGINE (Engine B) ===
+        // Feed the same tick into the corresponding Sniper engine (if exists)
+        // This keeps Sniper engines in sync with V2 without opening duplicate WS connections.
+        // Sniper engine processes independently — its own state, its own scan, its own push.
+        const sniperE = sniperBySymbol[e.symbol];
+        if (sniperE) {
+          try {
+            SniperEngine.handlePrice(sniperE, parseFloat(k.c), offset);
+            // scanSig returns the result if a signal fired (null otherwise)
+            const sniperResult = SniperEngine.scanSig(sniperE);
+            if (sniperResult && (sniperResult.action === 'LONG' || sniperResult.action === 'SHORT')) {
+              onSniperSignal(sniperE, sniperResult);
+            }
+          } catch (sniperErr) {
+            console.error(`[SNIPER:${e.symbol}] scan error:`, sniperErr.message);
+          }
+        }
+        // === END SNIPER MIRROR ===
         
         // Update the current 15m candle in e.c15
         const candleKey = Math.floor(k.t / 60000 / 15);
@@ -211,6 +303,19 @@ function connect(e) {
         const price = parseFloat(d.p);
         handlePrice(e, price, offsetMap[e.symbol] || 0);
         scanSig(e, CONFIG.minGrade, onSignal);
+        // Mirror to Sniper engine too
+        const sniperE = sniperBySymbol[e.symbol];
+        if (sniperE) {
+          try {
+            SniperEngine.handlePrice(sniperE, price, offsetMap[e.symbol] || 0);
+            const sniperResult = SniperEngine.scanSig(sniperE);
+            if (sniperResult && (sniperResult.action === 'LONG' || sniperResult.action === 'SHORT')) {
+              onSniperSignal(sniperE, sniperResult);
+            }
+          } catch (sniperErr) {
+            console.error(`[SNIPER:${e.symbol}] trade-stream scan error:`, sniperErr.message);
+          }
+        }
       }
     } catch (ex) {
       // ignore parse errors
@@ -260,8 +365,41 @@ const server = http.createServer(async (req, res) => {
       lastGrade: e.lastFireQuality,
       wsState: sockets[e.symbol] ? sockets[e.symbol].readyState : 'closed'
     }));
+    const sniperStatus = sniperEngines.map(e => ({
+      symbol: e.symbol + '-SNIPER',
+      price: e.price,
+      bias: e.bias,
+      signal: e.signal ? e.signal.action : 'NONE',
+      reason: e.signal ? e.signal.reason : '',
+      swept: e.swept.length
+    }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', uptime: process.uptime(), engines: status, journalSize: journal.length }, null, 2));
+    res.end(JSON.stringify({
+      status: 'ok',
+      uptime: process.uptime(),
+      engines: status,
+      sniperEngines: sniperStatus,
+      journalSize: journal.length,
+      sniperJournalSize: sniperJournal.length
+    }, null, 2));
+    return;
+  }
+
+  if (req.url === '/debug-sniper') {
+    const status = sniperEngines.map(e => ({
+      symbol: e.symbol,
+      price: e.price,
+      rawPrice: e.rawPrice,
+      bias: e.bias,
+      biasDetail: e.bd,
+      signal: e.signal,
+      swept: e.swept.map(s => ({ level: s.level, name: s.name, time: s.time })),
+      zones: e.zones.slice(0, 10),
+      c15Count: e.c15.length,
+      swH: e.swH, swL: e.swL
+    }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', sniperEngines: status, journal: sniperJournal.slice(-10) }, null, 2));
     return;
   }
 
@@ -370,26 +508,20 @@ const server = http.createServer(async (req, res) => {
   // Test Telegram endpoint — sends a test notification and shows the result
   if (req.url === '/test-ntfy' || req.url === '/test-telegram') {
     try {
-      const url = `https://api.telegram.org/bot${CONFIG.telegramBotToken}/sendMessage`;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-      const res2 = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: CONFIG.telegramChatId,
-          text: '🧪 ZAI QUAD FRAMEWORK\n\nTelegram notifications are working!\n\nYou will receive trading signals here.'
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-      const body = await res2.text();
+      const testText = '🧪 ZAI QUAD FRAMEWORK\n\nTelegram notifications are working!\n\nYou will receive trading signals here.';
+      const results = await Promise.allSettled(
+        CONFIG.telegramChatIds.map(id => sendToChat(id, testText))
+      );
+      const summary = CONFIG.telegramChatIds.map((id, i) => ({
+        chatId: id,
+        ok: results[i].status === 'fulfilled' && results[i].value === true
+      }));
+      const allOk = summary.every(s => s.ok);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ 
-        ok: res2.ok, 
-        status: res2.status, 
-        chatId: CONFIG.telegramChatId,
-        response: body.slice(0, 200)
+      res.end(JSON.stringify({
+        ok: allOk,
+        recipients: summary,
+        totalRecipients: CONFIG.telegramChatIds.length
       }, null, 2));
     } catch (err) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -414,12 +546,14 @@ server.listen(PORT, HOST, () => {
   console.log(`  ZAI QUAD FRAMEWORK — Cloud Server`);
   console.log(`========================================`);
   console.log(`HTTP:  http://${HOST}:${PORT}/health`);
-  console.log(`Telegram: Chat ID ${CONFIG.telegramChatId}`);
-  console.log(`Grade: ${CONFIG.minGrade}-only filter`);
+  console.log(`Telegram: ${CONFIG.telegramChatIds.length} recipient(s): ${CONFIG.telegramChatIds.join(', ')}`);
+  console.log(`Grade: ${CONFIG.minGrade}-only filter (Engine V2)`);
+  console.log(`Engine V2: BTC + XAU + ETH + EUR (15m, 3/4 bias, 60-min sweep)`);
+  console.log(`Engine SNIPER: BTC + XAU only (15m, 4/4 bias, 30-min sweep) — isolated`);
   console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}, XAG=${offsetMap.XAG}, EUR=${offsetMap.EUR}`);
   console.log(`========================================\n`);
 
-  // Bootstrap all engines, then connect WebSockets
+  // Bootstrap all V2 engines, then connect WebSockets
   // STAGGER: 15 seconds between instruments to stay under TwelveData's 8 calls/min limit
   // Each instrument makes 2 calls (15m + daily) = 8 total. With 15s gaps, that's ~1 min.
   (async () => {
@@ -429,10 +563,25 @@ server.listen(PORT, HOST, () => {
       // 15 second gap between instruments (TwelveData: 8 calls/min, we make 2 per instrument)
       await new Promise(r => setTimeout(r, 15000));
     }
-    console.log(`\n[${new Date().toISOString()}] All engines connected. Watching for signals...\n`);
+    console.log(`\n[${new Date().toISOString()}] All V2 engines connected. Watching for signals...`);
+
+    // === BOOTSTRAP SNIPER ENGINES (BTC + XAU only) ===
+    // Stagger after V2 to avoid TwelveData rate limit (need 2 more calls: BTC + XAU)
+    if (!sniperBootstrapped) {
+      sniperBootstrapped = true;
+      for (const se of sniperEngines) {
+        await SniperEngine.bootstrap(se, offsetMap[se.symbol] || 0);
+        // 15s gap to stay under TwelveData 8/min
+        await new Promise(r => setTimeout(r, 15000));
+      }
+      console.log(`[${new Date().toISOString()}] SNIPER engines bootstrapped (BTC + XAU).`);
+      console.log(`[SNIPER] Now receiving mirrored ticks from V2 WebSocket connections.`);
+      console.log(`[SNIPER] Signals will push to Telegram with [SNIPER] prefix.\n`);
+    }
   })();
 
   // Periodic maintenance every 5 min: refresh 1H + retry bootstrap if needed
+  // V2 maintenance
   setInterval(() => {
     engines.forEach(e => {
       refreshHtf(e, offsetMap[e.symbol] || 0);
@@ -441,17 +590,29 @@ server.listen(PORT, HOST, () => {
         const now = Date.now();
         if (!e._lastBootstrapRetry || now - e._lastBootstrapRetry > 300000) {
           e._lastBootstrapRetry = now;
-          console.log(`[${e.symbol}] Periodic bootstrap retry (c15=${e.c15.length})`);
+          console.log(`[V2:${e.symbol}] Periodic bootstrap retry (c15=${e.c15.length})`);
           bootstrap(e, offsetMap[e.symbol] || 0);
+        }
+      }
+    });
+    // Sniper maintenance — only retry bootstrap if low candles
+    sniperEngines.forEach(se => {
+      if (se.c15.length < 50) {
+        const now = Date.now();
+        if (!se._lastBootstrapRetry || now - se._lastBootstrapRetry > 300000) {
+          se._lastBootstrapRetry = now;
+          console.log(`[SNIPER:${se.symbol}] Periodic bootstrap retry (c15=${se.c15.length})`);
+          SniperEngine.bootstrap(se, offsetMap[se.symbol] || 0);
         }
       }
     });
   }, 300000);
 
-  // Status log every 5 minutes
+  // Status log every 5 minutes — both engines
   setInterval(() => {
-    const status = engines.map(e => `${e.symbol}:c15=${e.c15.length}/${e.bias}`).join(' ');
-    console.log(`[status ${new Date().toISOString().slice(11, 19)}] ${status}`);
+    const v2status = engines.map(e => `${e.symbol}:c15=${e.c15.length}/${e.bias}`).join(' ');
+    const snipStatus = sniperEngines.map(e => `${e.symbol}:c15=${e.c15.length}/${e.bias}`).join(' ');
+    console.log(`[status ${new Date().toISOString().slice(11, 19)}] V2: ${v2status} | SNIPER: ${snipStatus}`);
   }, 300000);
 });
 
