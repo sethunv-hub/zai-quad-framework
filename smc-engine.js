@@ -55,81 +55,49 @@ function fmtPrice(symbol, n) {
   if (n == null) return '—';
   if (symbol === 'BTC') return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
   if (symbol === 'XAU') return '$' + n.toFixed(1);
-  if (symbol === 'ETH') return '$' + n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  if (symbol === 'XAG') return '$' + n.toFixed(2);
   if (symbol === 'EUR') return '$' + n.toFixed(5);
   return '$' + n;
 }
 
-// ===== TWELVEDATA BOOTSTRAP (replaces Binance REST — no more IP bans) =====
-// TwelveData free tier: 800 calls/day, 8 calls/min. We use ~8 calls/day. Zero risk of ban.
-// IMPORTANT: 8 calls/min limit — must stagger fetches to avoid 429 errors.
-const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || '2577565126b44bf2bdff2d25e5f957f0';
-const TWELVEDATA_SYMBOLS = { BTC: 'BTC/USD', XAU: 'XAU/USD', EUR: 'EUR/USD', ETH: 'ETH/USD' };
+// ===== DATA LAYER (shared with Sniper + CL via market-data.js) =====
+// V2 reads 15m candles + 1d PDH/PDL from the shared cache. No direct REST calls.
+const marketData = require('./market-data');
 
-async function fetchTwelveData(tdSymbol, interval, outputsize) {
-  const url = `https://api.twelvedata.com/time_series?symbol=${tdSymbol}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVEDATA_KEY}`;
-  let retries = 3;
-  while (retries > 0) {
-    const r = await fetch(url);
-    if (r.status === 429) {
-      console.warn(`[TwelveData] Rate limited (429), waiting 60s... (${retries} retries left)`);
-      await new Promise(resolve => setTimeout(resolve, 60000)); // Wait 60s on rate limit
-      retries--;
-      continue;
-    }
-    if (!r.ok) throw new Error('TwelveData HTTP ' + r.status);
-    const data = await r.json();
-    if (data.status === 'error' || data.code === 429) throw new Error('TwelveData: ' + (data.message || 'rate limited'));
-    if (!data.values || !Array.isArray(data.values)) throw new Error('TwelveData: no values');
-    // TwelveData returns newest first — reverse to oldest first
-    return data.values.reverse().map(v => ({
-      t: new Date(v.datetime + 'Z').getTime(),
-      o: parseFloat(v.open), h: parseFloat(v.high),
-      l: parseFloat(v.low), c: parseFloat(v.close)
-    }));
-  }
-  throw new Error('TwelveData: max retries exceeded');
-}
-
-// ===== Bootstrap (v2 logic + TwelveData — no Binance REST, no bans) =====
+// ===== Bootstrap (V2 — reads from shared market-data cache) =====
+// Populates e.c15 from the shared 15m cache, sets PDH/PDL from shared daily cache.
+// No REST calls — all data comes from market-data.js which fetches once per instrument.
 async function bootstrap(e, offset) {
   if (e.c15.length >= 50) return;
-  
-  const tdSymbol = TWELVEDATA_SYMBOLS[e.symbol] || e.stream.toUpperCase();
-  console.log(`[${e.symbol}] Bootstrapping from TwelveData (${tdSymbol})...`);
-  
-  try {
-    const d15 = await fetchTwelveData(tdSymbol, '15min', 100);
-    if (d15 && d15.length > 0) {
-      e.c15 = d15.map(k => ({
-        key: Math.floor(k.t/60000/15),
-        o: k.o+offset, h: k.h+offset,
-        l: k.l+offset, c: k.c+offset,
-        t: new Date(k.t)
-      }));
-      console.log(`[${e.symbol}] Loaded ${e.c15.length} 15m candles from TwelveData`);
-    }
-  } catch (err) { console.warn(`[${e.symbol}] TwelveData 15m bootstrap failed:`, err.message); }
-  
-  try {
-    const d1d = await fetchTwelveData(tdSymbol, '1day', 5);
-    if (d1d && d1d.length >= 2) {
-      const prev = d1d[d1d.length - 2];
-      e.pdh = prev.h + offset;
-      e.pdl = prev.l + offset;
-      console.log(`[${e.symbol}] Loaded daily: PDH=${e.pdh}, PDL=${e.pdl}`);
-    }
-  } catch (err) { console.warn(`[${e.symbol}] TwelveData daily bootstrap failed:`, err.message); }
-  
+
+  console.log(`[V2:${e.symbol}] Bootstrap from shared cache...`);
+  const cached15m = marketData.getCandles(e.symbol, '15m');
+  const cachedDaily = marketData.getDaily(e.symbol);
+
+  if (cached15m.length > 0) {
+    e.c15 = cached15m.map(k => ({
+      key: Math.floor(k.t / 60000 / 15),
+      o: k.o, h: k.h, l: k.l, c: k.c,
+      t: new Date(k.t)
+    }));
+    console.log(`[V2:${e.symbol}] Loaded ${e.c15.length} 15m candles from shared cache`);
+  } else {
+    console.warn(`[V2:${e.symbol}] No 15m candles in cache yet — will retry`);
+    return;
+  }
+
+  if (cachedDaily) {
+    e.pdh = cachedDaily.pdh;
+    e.pdl = cachedDaily.pdl;
+    console.log(`[V2:${e.symbol}] PDH=${e.pdh}, PDL=${e.pdl} from shared cache`);
+  }
+
   if (e.c15.length > 0) {
     const last = e.c15[e.c15.length - 1];
-    e.cb = [{ minuteKey: Math.floor(Date.now()/60000), o: last.c, h: last.c, l: last.c, c: last.c, t: new Date() }];
+    e.cb = [{ minuteKey: Math.floor(Date.now() / 60000), o: last.c, h: last.c, l: last.c, c: last.c, t: new Date() }];
     bootSess(e); detectSwings(e); updateZones(e); updateBias(e);
-    // NOTE: Don't call bootPD() — it overwrites the correct TwelveData PDH/PDL with wrong 15m-based values
     if (e.price == null) handlePrice(e, last.c, offset);
-    console.log(`[${e.symbol}] Bootstrap complete: ${e.c15.length} candles, bias=${e.bias}, price=${fmtPrice(e.symbol, last.c)}`);
-  } else {
-    console.error(`[${e.symbol}] Bootstrap FAILED — no 15m candles loaded. Will retry in 5min.`);
+    console.log(`[V2:${e.symbol}] Bootstrap complete: ${e.c15.length} candles, bias=${e.bias}, price=${fmtPrice(e.symbol, last.c)}`);
   }
 }
 
@@ -158,10 +126,12 @@ function bootPD(e) {
   if (f) { e.pdh = ph; e.pdl = pl; }
 }
 
-function handlePrice(e, price, offset) {
+function handlePrice(e, price, offset, minGrade, onSignal) {
   if (!price || price < 0.5 || price > 1000000) return;
   const adj = offset !== 0 ? price + offset : price;
   e.prev = e.price; e.price = adj;
+  e.rawPrice = price; e.lu = new Date();   // M5 fix: matches index.html line 629
+  e.lhb = Date.now();                      // M5 fix: enable heartbeat check in server.js
   e.ph.push({ t: new Date(), p: adj });
   if (e.ph.length > 500) e.ph.shift();
   if (e.c15.length === 0) {
@@ -176,7 +146,8 @@ function handlePrice(e, price, offset) {
   try {
     updateCB(e, adj); updateSess(e, adj);
     updateZones(e); detectSweeps(e); updateBias(e);
-    scanSig(e);
+    // M8 fix: pass minGrade + onSignal through so signals fire the Telegram push
+    scanSig(e, minGrade, onSignal);
   } catch (err) {
     console.error(`[${e.symbol}] handlePrice error:`, err.message);
   }
@@ -221,8 +192,16 @@ function updateSess(e, p) {
   if (se.h == null) se.h = p;
   if (se.l == null) se.l = p;
   se.h = Math.max(se.h, p); se.l = Math.min(se.l, p);
-  // BUG FIX: This was overwriting TwelveData PDH/PDL with session-based values at UTC midnight
-  // Removed — PDH/PDL now come from TwelveData daily candles (set in bootstrap)
+  // UTC midnight session reset (matches index.html line 645)
+  // At UTC midnight, the previous day's sessions are complete — promote them to PDH/PDL,
+  // then reset the session map so today's sessions build fresh.
+  // CRITICAL: without this, sessions accumulate multi-day highs/lows and corrupt
+  // session_high/session_low zones + sweep detection.
+  if (gH() === 0) {
+    e.pdh = Math.max(e.ses.asian.h || 0, e.ses.london.h || 0, e.ses.ny.h || 0);
+    e.pdl = Math.min(e.ses.asian.l || 9e9, e.ses.london.l || 9e9, e.ses.ny.l || 9e9);
+    e.ses = { asian: { h: null, l: null }, london: { h: null, l: null }, ny: { h: null, l: null } };
+  }
 }
 
 function updateZones(e) {
@@ -358,7 +337,7 @@ function updateBias(e) {
     var macroNeutral = !mBull && !mBear;
     // LOOSENED CT FILTER: Allow momentum to flip bias even against macro trend
     // Tag as counter-trend (lower strength=2) so the engine knows it's higher risk
-    // Previously: BLOCKED flip entirely → missed all reversal trades on BTC/Gold/ETH
+    // Previously: BLOCKED flip entirely → missed all reversal trades on BTC/Gold/Silver
     // Now: ALLOW flip with reduced strength → signals can fire on reversals
     if (structureAgrees || macroAgrees || macroNeutral || mb !== 'neutral') {
       bias = mb;
@@ -407,9 +386,14 @@ function scanSig(e, minGrade, onSignal) {
     var cdMins = { A: 10, B: 25, C: 45 }[e.lastFireQuality] || 30;
     var elapsed = now - e.lastFireTime;
     if (elapsed < cdMins * 60000) {
-      e.signal = { action: 'WAIT', reason: 'Cooldown ' + (cdMins - Math.floor(elapsed / 60000)) + 'm (last was ' + e.lastFireQuality + '-grade)' };
+      e.signal = { action: 'WAIT', reason: 'Cooldown ' + (cdMins - Math.floor(elapsed / 60000)) + 'm (last was ' + e.lastFireQuality + '-grade, ' + Math.floor(elapsed / 60000) + 'm ago)' };
       return;
     }
+  } else if (e.lastFireTime && now - e.lastFireTime < 1800000) {
+    // Fallback cooldown (matches index.html line 734-737)
+    // If lastFireQuality is somehow missing, fall back to 30-min default
+    e.signal = { action: 'WAIT', reason: 'Cooldown ' + (30 - Math.floor((now - e.lastFireTime) / 60000)) + 'm' };
+    return;
   }
   var lc = e.c15[e.c15.length - 1];
   if (!lc) { e.signal = { action: 'WAIT', reason: 'Building candles…' }; return; }
@@ -569,9 +553,7 @@ function evaluate(e) {
   var zr = Math.abs(entry - sl);
   var rwp = e.config.riskWidePct || 0.008;
   if (zr > cp * rwp) return { action: 'WAIT', reason: 'Risk too wide' };
-  // Min SL filter
-  var minSlPct = (e.symbol === 'BTC' || e.symbol === 'ETH') ? 0.003 : 0.002;
-  if (zr < cp * minSlPct) return { action: 'WAIT', reason: 'SL too tight (' + (zr / cp * 100).toFixed(2) + '%)' };
+  // (Removed cloud's min-SL filter — index.html does not have this. It was silently killing tight-setup signals.)
 
   // Targets — liquidity zones in trade direction
   var untouched = e.zones.filter(function(z) { return !z.swept; });
@@ -593,7 +575,11 @@ function evaluate(e) {
 
   var tp1, tp2, tp3;
   if (inDir.length === 0) {
-    return { action: 'WAIT', reason: 'No liquidity zone in trade direction for TP' };
+    // Fallback (matches index.html line 806): no unswept liquidity zone in trade direction,
+    // use 1.5R as TP1 target instead of rejecting.
+    var tp1L = bias === 'bullish' ? entry + zr * 1.5 : entry - zr * 1.5;
+    tp1 = { level: tp1L, stars: 1, name: 'Fallback' };
+    tp2 = null; tp3 = null;
   } else {
     var minTP1R = zr * 1.0;
     var tp1C = inDir.filter(function(z) { return Math.abs(z.level - entry) >= minTP1R; });
@@ -614,12 +600,14 @@ function evaluate(e) {
   if (bias === 'bullish' && tp1.level <= entry) return { action: 'WAIT', reason: 'TP1 below entry' };
   if (bias === 'bearish' && tp1.level >= entry) return { action: 'WAIT', reason: 'TP1 above entry' };
 
-  // Grade (structural zone required for B+)
-  var isStructural = function(z) { return z && z.type !== 'round'; };
+  // Grade (matches index.html line 822 — no isStructural gate)
   var quality = 'C';
   var t3s = tp3 ? tp3.stars : 0, t2s = tp2 ? tp2.stars : 0;
-  if (t3s >= 3 && t2s >= 2 && trigger && confl && isStructural(tp1)) quality = 'A';
-  else if (t2s >= 2 && (trigger || confl) && isStructural(tp1)) quality = 'B';
+  if (t3s >= 3 && t2s >= 2 && trigger && confl) quality = 'A';
+  else if (t2s >= 2 && (trigger || confl)) quality = 'B';
+
+  var rr2 = tp2 ? (zr > 0 ? Math.abs(tp2.level - entry) / zr : 0) : null;
+  var rr3 = tp3 ? (zr > 0 ? Math.abs(tp3.level - entry) / zr : 0) : null;
 
   return {
     action: bias === 'bullish' ? 'LONG' : 'SHORT',
@@ -627,19 +615,34 @@ function evaluate(e) {
     confidence: (trigger ? 2 : 0) + (confl ? 2 : 0) + (isSessWin() ? 1 : 0) + (quality === 'A' ? 1 : 0),
     entry: entry, sl: sl,
     tp1: tp1.level, tp2: tp2 ? tp2.level : null, tp3: tp3 ? tp3.level : null,
-    zoneRisk: zr, rr1: rr1, rr2: 0, rr3: 0,
+    zoneRisk: zr, rr1: rr1, rr2: rr2, rr3: rr3,
     sweep: sweep, trigger: trigger, confluence: conflDesc,
     reason: (trigger || 'Confluence') + ' at ' + sweep.name + ' • TP1 ' + rr1.toFixed(1) + 'R'
   };
 }
 
-// Refresh — kept simple (not used by v2 bias, but doesn't hurt)
+// Refresh — V2's PDH/PDL refresh is now handled by market-data.js scheduled jobs.
+// This function is kept for backwards compat but is a no-op — server.js may still call it.
+// market-data.js refreshes 1d every 2 hours and updates the shared cache.
+// V2 reads PDH/PDL from the cache via syncPdhPdl() below.
 async function refreshHtf(e, offset) {
-  // v2 doesn't use 1H — this is a no-op
+  // No-op — market-data.js handles all REST refreshes
   return;
 }
 
+// Sync PDH/PDL from shared cache into engine state.
+// Called by server.js on every tick before scanSig runs, so V2 always has fresh PDH/PDL.
+function syncPdhPdl(e) {
+  const cachedDaily = marketData.getDaily(e.symbol);
+  if (cachedDaily) {
+    if (e.pdh !== cachedDaily.pdh || e.pdl !== cachedDaily.pdl) {
+      e.pdh = cachedDaily.pdh;
+      e.pdl = cachedDaily.pdl;
+    }
+  }
+}
+
 module.exports = {
-  makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend,
-  detectSwings, updateZones, updateBias
+  makeEngine, bootstrap, refreshHtf, syncPdhPdl, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend,
+  detectSwings, detectSweeps, updateZones, updateBias
 };

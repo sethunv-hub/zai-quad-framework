@@ -84,69 +84,46 @@ function makeSniperEngine(symbol, stream, config) {
   };
 }
 
-// ===== BOOTSTRAP ( TwelveData REST — same as V2 to avoid Binance IP bans) =====
-const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || '2577565126b44bf2bdff2d25e5f957f0';
-const TWELVEDATA_SYMBOLS = { BTC: 'BTC/USD', XAU: 'XAU/USD' };
+// ===== DATA LAYER (shared with V2 + CL via market-data.js) =====
+// Sniper reads 15m candles from the shared cache. No direct REST calls.
+const marketData = require('./market-data');
 
-async function fetchTwelveData(tdSymbol, interval, outputsize) {
-  const url = `https://api.twelvedata.com/time_series?symbol=${tdSymbol}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVEDATA_KEY}`;
-  let retries = 3;
-  while (retries > 0) {
-    const r = await fetch(url);
-    if (r.status === 429) {
-      console.warn(`[SNIPER] TwelveData rate limited, waiting 60s... (${retries} retries left)`);
-      await new Promise(resolve => setTimeout(resolve, 60000));
-      retries--;
-      continue;
-    }
-    if (!r.ok) throw new Error('TwelveData HTTP ' + r.status);
-    const data = await r.json();
-    if (data.status === 'error' || data.code === 429) throw new Error('TwelveData: ' + (data.message || 'rate limited'));
-    return data;
-  }
-  throw new Error('TwelveData: exhausted retries');
-}
-
+// ===== Bootstrap (Sniper — reads from shared market-data cache) =====
+// No REST calls — all data comes from market-data.js which fetches once per instrument.
 async function bootstrap(e, offset) {
   if (e.c15.length >= 50) return;
-  try {
-    const tdSym = TWELVEDATA_SYMBOLS[e.symbol];
-    console.log(`[SNIPER:${e.symbol}] Bootstrapping from TwelveData (${tdSym}, 15m)...`);
-    const data = await fetchTwelveData(tdSym, '15min', 100);
-    if (!data.values || !data.values.length) throw new Error('No data');
+  console.log(`[SNIPER:${e.symbol}] Bootstrap from shared cache...`);
 
-    // TwelveData returns newest first — reverse to oldest first
-    const values = data.values.slice().reverse();
-    e.c15 = values.map(function(v) {
-      return {
-        key: Math.floor(new Date(v.datetime).getTime() / 60000 / 15),
-        o: parseFloat(v.open) + offset,
-        h: parseFloat(v.high) + offset,
-        l: parseFloat(v.low) + offset,
-        c: parseFloat(v.close) + offset,
-        t: new Date(v.datetime)
-      };
-    });
-    if (e.c15.length > 100) e.c15 = e.c15.slice(-100);
-
-    // Initialize current-minute bucket
-    var last = e.c15[e.c15.length - 1];
-    e.cb = [{ minuteKey: Math.floor(Date.now() / 60000), o: last.c, h: last.c, l: last.c, c: last.c, t: new Date() }];
-
-    bootSess(e);
-    bootPD(e);
-    detectSwings(e);
-    updateZones(e);
-    updateBias(e);
-
-    if (e.price == null) {
-      e.price = last.c;
-      e.rawPrice = last.c - offset;
-    }
-    console.log(`[SNIPER:${e.symbol}] Bootstrap OK — ${e.c15.length} candles, bias=${e.bias}`);
-  } catch (err) {
-    console.error(`[SNIPER:${e.symbol}] Bootstrap failed:`, err.message);
+  const cached15m = marketData.getCandles(e.symbol, '15m');
+  if (cached15m.length === 0) {
+    console.warn(`[SNIPER:${e.symbol}] No 15m candles in cache yet — will retry`);
+    return;
   }
+
+  e.c15 = cached15m.map(function(k) {
+    return {
+      key: Math.floor(k.t / 60000 / 15),
+      o: k.o, h: k.h, l: k.l, c: k.c,
+      t: new Date(k.t)
+    };
+  });
+  if (e.c15.length > 100) e.c15 = e.c15.slice(-100);
+
+  // Initialize current-minute bucket
+  var last = e.c15[e.c15.length - 1];
+  e.cb = [{ minuteKey: Math.floor(Date.now() / 60000), o: last.c, h: last.c, l: last.c, c: last.c, t: new Date() }];
+
+  bootSess(e);
+  bootPD(e);
+  detectSwings(e);
+  updateZones(e);
+  updateBias(e);
+
+  if (e.price == null) {
+    e.price = last.c;
+    e.rawPrice = last.c - offset;
+  }
+  console.log(`[SNIPER:${e.symbol}] Bootstrap OK — ${e.c15.length} candles, bias=${e.bias}`);
 }
 
 function bootSess(e) {
@@ -177,13 +154,14 @@ function bootPD(e) {
 }
 
 // ===== PRICE HANDLING (matches SMC Sniper HTML handlePrice exactly) =====
-function handlePrice(e, price, offset) {
+function handlePrice(e, price, offset, onSignal) {
   if (!price || price < 100 || price > 1000000) return;
   var adj = offset !== 0 ? price + offset : price;
   e.prev = e.price;
   e.price = adj;
   e.rawPrice = price;
   e.lu = new Date();
+  e.lhb = Date.now();
   e.ph.push({ t: new Date(), p: adj });
   if (e.ph.length > 500) e.ph.shift();
   try {
@@ -192,7 +170,8 @@ function handlePrice(e, price, offset) {
     updateZones(e);
     detectSweeps(e);
     updateBias(e);
-    scanSig(e);
+    // Pass onSignal through so scanSig can fire the Telegram push directly
+    scanSig(e, onSignal);
   } catch (err) {
     console.error(`[SNIPER:${e.symbol}] handlePrice error:`, err.message);
   }
@@ -316,8 +295,9 @@ function detectSweeps(e) {
     else clusters.push(s);
   });
   clusters.forEach(function(s) { e.swept.push(Object.assign({}, s, { locked: true })); });
-  // CRITICAL DIFFERENCE FROM V2: 30-min sweep lookback (V2 uses 60-min)
-  e.swept = e.swept.filter(function(s) { return (new Date() - s.time) < 1800000; });
+  // Sweep memory TTL — matches SMC Sniper HTML line 376 (7200000ms = 2 hours)
+  // CRITICAL FIX: previously was 1800000 (30 min) which caused re-detection of same zone as "new" sweep after 30 min
+  e.swept = e.swept.filter(function(s) { return (new Date() - s.time) < 7200000; });
 }
 
 function updateBias(e) {
@@ -403,7 +383,11 @@ function isConsumed(e, s) {
 }
 
 // ===== SIGNAL SCAN (matches SMC Sniper HTML scanSig + evaluate exactly) =====
-function scanSig(e) {
+// Uses callback pattern (like V2) so handlePrice can fire the Telegram push directly.
+// CRITICAL FIX: previously scanSig was called twice (once inside handlePrice, once outside)
+// and the second call always returned undefined because e.actSig was already set by the first.
+// This made the Sniper engine completely silent — no signals ever pushed to Telegram.
+function scanSig(e, onSignal) {
   if (!e.price) { e.signal = null; return; }
   var now = Date.now();
   // Lock active signal for 5 minutes
@@ -440,7 +424,9 @@ function scanSig(e) {
     e.lockUntil = now + 300000;
     e.signal = result;
     e.signal.currentPrice = e.price;
-    // Return the result so caller (server.js) can fire the Telegram push
+    // CRITICAL FIX: fire callback directly so Telegram push happens (was previously returned
+    // and ignored by the duplicate scanSig call in server.js)
+    if (onSignal) onSignal(e, result);
     return result;
   } else {
     e.signal = result;

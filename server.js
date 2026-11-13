@@ -3,7 +3,15 @@
 // No dashboard. No browser. Just signals to your phone.
 
 const WebSocket = require('ws');
-const { makeEngine, bootstrap, refreshHtf, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, calcAtr, htfBias, detectSwings, updateZones, updateBias } = require('./smc-engine');
+const { makeEngine, bootstrap, refreshHtf, syncPdhPdl, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, htfBias, detectSwings, detectSweeps, updateZones, updateBias } = require('./smc-engine');
+
+// ===== SHARED DATA LAYER =====
+// market-data.js is the SINGLE source of truth for all candle data.
+// All 3 engines (V2, Sniper, CL) read from this cache — no engine makes its own REST calls.
+// 5m/15m update in real-time via WebSockets (free, unlimited).
+// 1h refreshes at :00:05 every hour. 1d refreshes every 2 hours.
+// Total: ~160 REST calls/day (vs ~2,496 before — 94% reduction).
+const marketData = require('./market-data');
 
 // ===== SNIPER ENGINE (Engine B) — runs in parallel, ISOLATED from V2 =====
 // This is the EXACT logic from smc-signals-mobile.html (4/4 bias, 30-min sweep lookback)
@@ -22,6 +30,23 @@ const sniperEngines = [
 const sniperBySymbol = {};
 sniperEngines.forEach(e => { sniperBySymbol[e.symbol] = e; });
 let sniperBootstrapped = false;
+
+// ===== CL ENGINE (Engine C) — runs in parallel, ISOLATED from V2 + Sniper =====
+// This is the EXACT logic from cl-btc-xau.html (5m LTF, 1h HTF, 1d daily, 9-point checklist)
+// Instruments: BTC + XAU + XAG + EUR (expanded per user request)
+// Push format: "CL BTC SELL" / "CL XAU BUY" / "CL XAG SELL" / "CL EUR BUY"
+// Has its OWN WebSocket connection (5m kline stream) — does NOT share with V2/Sniper
+const CleanEngine = require('./smc-engine-cl');
+const clEngines = [
+  CleanEngine.makeCLEngine('BTC', 'btcusdt', { futures: false, weekendSuppress: false }),
+  CleanEngine.makeCLEngine('XAU', 'paxgusdt', { futures: false, weekendSuppress: false }),
+  CleanEngine.makeCLEngine('XAG', 'xagusdt', { futures: true,  weekendSuppress: false }),  // Silver on Binance Futures
+  CleanEngine.makeCLEngine('EUR', 'eurusdt', { futures: false, weekendSuppress: true  })   // Forex — closed weekends
+];
+const clBySymbol = {};
+clEngines.forEach(e => { clBySymbol[e.symbol] = e; });
+let clBootstrapped = false;
+const clSockets = {}; // separate socket map for CL 5m connections
 
 // ===== CONFIGURATION =====
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
@@ -56,12 +81,12 @@ const engines = [
   makeEngine('XAU', 'paxgusdt', {
     prefix: 'gold', slBuffer: 2.5, minRisk: 6, maxRisk: 30,
     roundStars: 1, riskWidePct: 0.008, breakoutTh: 0.0015, pullbackTh: 0.005,
-    roundStep: 100, weekendSuppress: true, futures: false
+    roundStep: 100, weekendSuppress: false, futures: false    // C1 fix: matches index.html — PAXG trades 24/7 on Binance, no weekend suppression
   }),
-  makeEngine('ETH', 'ethusdt', {
-    prefix: 'eth', slBuffer: 25, minRisk: 75, maxRisk: 1500,
-    roundStars: 2, riskWidePct: 0.008, breakoutTh: 0.003, pullbackTh: 0.01,
-    roundStep: 500, weekendSuppress: false, futures: false
+  makeEngine('XAG', 'xagusdt', {
+    prefix: 'silver', slBuffer: 0.05, minRisk: 0.10, maxRisk: 0.50,
+    roundStars: 2, riskWidePct: 0.015, breakoutTh: 0.003, pullbackTh: 0.007,
+    roundStep: 1, weekendSuppress: false, futures: true   // Silver on Binance Futures (matches index.html line 425)
   }),
   makeEngine('EUR', 'eurusdt', {
     prefix: 'eur', slBuffer: 0.0008, minRisk: 0.0008, maxRisk: 0.0050,
@@ -116,31 +141,28 @@ async function sendToChat(chatId, text) {
 
 // ===== SIGNAL HANDLER — fires when a valid signal passes all filters =====
 async function onSignal(e, sig) {
-  const nameMap = { BTC: 'BTC', XAU: 'XAU', ETH: 'ETH', EUR: 'EUR' };
+  const nameMap = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' };
   const instShort = nameMap[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
-  const title = `${emoji} [V2] ZAI ${instShort} ${dir} [${sig.quality} ${sig.score}/9]`;
+  const title = `${emoji} [V2] ZAI ${instShort} ${dir} [${sig.quality}]`;
   const phtStr = fmtPht(Date.now());
-  
-  // Build checklist summary (which checks passed)
-  const checkSummary = sig.checks ? sig.checks.filter(c => c.ok).map(c => c.k).join('+') : '';
   
   // Position sizing (0.5% of $500 default account)
   const account = parseFloat(process.env.ACCOUNT_SIZE || '500');
   const riskPct = parseFloat(process.env.RISK_PCT || '0.5');
   const riskUsd = account * riskPct / 100;
-  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'ETH' ? 1 : e.symbol === 'XAU' ? 100 : 100000;
+  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'XAU' ? 100 : e.symbol === 'XAG' ? 100 : 100000;  // XAG: 100 oz per lot (typical silver contract)
   const lotsRaw = riskUsd / (sig.zoneRisk * contractSize);
-  const lots = Math.floor(lotsRaw * 100) / 100;
+  // Fallback: if lots rounds to 0 (risk too tight), use minimum 0.01 lots
+  const lots = Math.max(0.01, Math.floor(lotsRaw * 100) / 100);
   
   const msg = `Entry: ${fmtPrice(e.symbol, sig.entry)}
 SL: ${fmtPrice(e.symbol, sig.sl)} (ATR)
 TP1: ${fmtPrice(e.symbol, sig.tp1)} (${sig.rr1.toFixed(1)}R)${sig.tp2 ? ' | TP2: ' + fmtPrice(e.symbol, sig.tp2) + ' (' + sig.rr2.toFixed(1) + 'R)' : ''}
 1H: ${sig.htfBias || '—'} | Trigger: ${sig.trigger || '—'}
 Sweep: ${sig.sweep.name}${sig.poi ? ' | POI: ' + sig.poi.type : ''} | KZ: ${sig.killZone ? '✓' : '✗'}
-Score: ${sig.score}/9 (${checkSummary}) | Time: ${phtStr}
-Risk: $${riskUsd.toFixed(0)} → ${lots} lots`;
+Risk: ${fmtPrice(e.symbol, sig.zoneRisk)} | Account: $${riskUsd.toFixed(0)} → ${lots} lots | Time: ${phtStr}`;
 
   console.log(`\n[${new Date().toISOString()}] ${title}`);
   console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
@@ -180,7 +202,7 @@ function curSessName() {
 // ===== SNIPER SIGNAL HANDLER (Engine B) — pushes to Telegram with [SNIPER] prefix =====
 // ISOLATED from V2's onSignal. Separate function, separate state, separate prefix.
 async function onSniperSignal(e, sig) {
-  const instShort = e.symbol === 'BTC' ? 'BTC' : 'XAU';
+  const instShort = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' }[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
   // [SNIPER] prefix distinguishes these signals from V2's [V2] signals
@@ -214,6 +236,112 @@ Risk: ${SniperEngine.fmtPrice(e.symbol, sig.zoneRisk)}`;
 }
 const sniperJournal = [];
 
+// ===== CL SIGNAL HANDLER (Engine C) — pushes to Telegram with "CL BTC SELL" prefix =====
+// ISOLATED from V2 and Sniper. Separate function, separate state, separate prefix.
+// Format EXACTLY matches cl-btc-xau.html (per user request):
+//   "CL BTC SELL\nEntry: ...\nSL: ...\nTP: ... / ...\nTime: ... PHT\nTrigger: ...\nSweep: ..."
+async function onCLSignal(e, setup) {
+  const instShort = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const dir = setup.dir === 'long' ? 'BUY' : 'SELL';
+  const emoji = setup.dir === 'long' ? '📈' : '📉';
+  // Title starts with "CL BTC SELL" / "CL XAU BUY" — exactly as user requested
+  const title = `${emoji} CL ${instShort} ${dir} — ${setup.grade} • ${setup.score}/9`;
+  const phtStr = CleanEngine.fmtPht(setup.formedAt);
+
+  const msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, setup.entry)}
+SL: ${CleanEngine.fmtPrice(e.symbol, setup.stop)}
+TP: ${CleanEngine.fmtPrice(e.symbol, setup.tp1)} / ${CleanEngine.fmtPrice(e.symbol, setup.tp2)}
+Time: ${phtStr}
+Trigger: ${setup.trigger}
+Sweep: ${setup.sweep.label}`;
+
+  console.log(`\n[${new Date().toISOString()}] ${title}`);
+  console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
+
+  // Push to Telegram (same channel as V2 + Sniper, but with CL prefix to distinguish)
+  await sendNtfy(title, msg);
+
+  // Log to separate CL journal
+  clJournal.push({
+    timestamp: new Date().toISOString(),
+    instrument: e.symbol, action: setup.dir === 'long' ? 'LONG' : 'SHORT',
+    grade: setup.grade, score: setup.score,
+    entry: setup.entry, sl: setup.stop,
+    tp1: setup.tp1, tp2: setup.tp2,
+    rr1: setup.rr1, rr2: setup.rr2, risk: setup.risk,
+    sweep: setup.sweep.label, trigger: setup.trigger, poi: setup.poi,
+    htfBias: e.an ? e.an.bias : null, formedAt: setup.formedAt,
+    outcome: 'pending'
+  });
+  if (clJournal.length > 200) clJournal.shift();
+}
+const clJournal = [];
+
+// ===== CL OUTCOME HANDLER (Engine C lifecycle) — fires when a CL signal transitions state =====
+// Port of cl-btc-xau.html EV map (lines 563-574) + notify() function (line 576)
+// Fires on: filled, tp1, tp2, be, stopped, missed, invalid, expired
+async function onCLOutcome(e, outcomeType, sig) {
+  const instShort = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const dir = sig.dir === 'long' ? 'BUY' : 'SELL';
+  const phtStr = CleanEngine.fmtPht(Date.now());
+
+  // Build title + message based on outcome type (matches HTML EV map)
+  let title = '', msg = '';
+  switch (outcomeType) {
+    case 'filled':
+      title = `✅ CL ${instShort} ${dir} entry zone reached`;
+      msg = `Price tapped ${CleanEngine.fmtPrice(e.symbol, sig.entry)}. SL ${CleanEngine.fmtPrice(e.symbol, sig.stop)} | TP1 ${CleanEngine.fmtPrice(e.symbol, sig.tp1)} | Time: ${phtStr}`;
+      break;
+    case 'tp1':
+      title = `🎯 CL ${instShort} TP1 hit`;
+      msg = `TP1 ${CleanEngine.fmtPrice(e.symbol, sig.tp1)} reached. Consider a partial and moving the stop to break-even. | Time: ${phtStr}`;
+      break;
+    case 'tp2':
+      title = `🏆 CL ${instShort} TP2 hit +${(sig.r || 0).toFixed(2)}R`;
+      msg = `Full target ${CleanEngine.fmtPrice(e.symbol, sig.tp2)} reached. | Time: ${phtStr}`;
+      break;
+    case 'be':
+      title = `🤝 CL ${instShort} closed at break-even after TP1 +${(sig.r || 0).toFixed(2)}R`;
+      msg = `Price returned to entry after TP1. | Time: ${phtStr}`;
+      break;
+    case 'stopped':
+      title = `❌ CL ${instShort} ${dir} stopped out -1R`;
+      msg = `Stop ${CleanEngine.fmtPrice(e.symbol, sig.stop)} hit. Review before the next trade. | Time: ${phtStr}`;
+      break;
+    case 'missed':
+      title = `⏳ CL ${instShort} ${dir} setup missed`;
+      msg = `Price reached TP1 without filling the entry. Do not chase. | Time: ${phtStr}`;
+      break;
+    case 'invalid':
+      title = `🚫 CL ${instShort} ${dir} setup invalidated`;
+      msg = `Price closed beyond the stop before filling. Idea cancelled. | Time: ${phtStr}`;
+      break;
+    case 'expired':
+      title = `⌛ CL ${instShort} ${dir} setup expired`;
+      msg = `Entry not reached within 40 bars. Idea cancelled. | Time: ${phtStr}`;
+      break;
+    default:
+      return; // unknown outcome type — skip
+  }
+
+  console.log(`\n[${new Date().toISOString()}] ${title}`);
+  console.log(`  ${msg}\n`);
+
+  // Push to Telegram
+  await sendNtfy(title, msg);
+
+  // Update journal entry — find the original setup in clJournal and mark outcome
+  // (match by instrument + formedAt timestamp)
+  for (let i = clJournal.length - 1; i >= 0; i--) {
+    if (clJournal[i].instrument === e.symbol && clJournal[i].formedAt === sig.formedAt) {
+      clJournal[i].outcome = outcomeType;
+      clJournal[i].closedAt = new Date().toISOString();
+      clJournal[i].r = sig.r || 0;
+      break;
+    }
+  }
+}
+
 // ===== WEBSOCKET CONNECTIONS — use kline stream for candle data =====
 const sockets = {};
 
@@ -245,29 +373,39 @@ function connect(e) {
 
         // === MIRROR TICK TO SNIPER ENGINE (Engine B) ===
         // Feed the same tick into the corresponding Sniper engine (if exists)
-        // This keeps Sniper engines in sync with V2 without opening duplicate WS connections.
-        // Sniper engine processes independently — its own state, its own scan, its own push.
+        // CRITICAL FIX: pass onSniperSignal as callback so scanSig can fire the Telegram push directly.
+        // Previously this called handlePrice() then scanSig() again — but handlePrice already calls
+        // scanSig internally, and the second call would always return undefined (because e.actSig
+        // was already set by the first call). This made the Sniper engine completely silent.
         const sniperE = sniperBySymbol[e.symbol];
         if (sniperE) {
           try {
-            SniperEngine.handlePrice(sniperE, parseFloat(k.c), offset);
-            // scanSig returns the result if a signal fired (null otherwise)
-            const sniperResult = SniperEngine.scanSig(sniperE);
-            if (sniperResult && (sniperResult.action === 'LONG' || sniperResult.action === 'SHORT')) {
-              onSniperSignal(sniperE, sniperResult);
-            }
+            SniperEngine.handlePrice(sniperE, parseFloat(k.c), offset, onSniperSignal);
           } catch (sniperErr) {
             console.error(`[SNIPER:${e.symbol}] scan error:`, sniperErr.message);
           }
         }
         // === END SNIPER MIRROR ===
         
-        // Update the current 15m candle in e.c15
+        // === UPDATE SHARED DATA LAYER ===
+        // Push this 15m kline to the shared cache so all engines see the same data.
+        // This is a no-cost operation (in-memory) — no REST API call.
+        marketData.updateFromWebSocket(e.symbol, '15m', k, offset);
+        
+        // Sync V2's PDH/PDL from shared cache (in case market-data refreshed 1d)
+        syncPdhPdl(e);
+        
+        // === V2 ENGINE: Update candle + run all detection on EVERY tick (matches index.html behavior) ===
+        // BUG FIX (2026-11-09): Previously only called detectSweeps/updateZones/updateBias when a NEW
+        // candle started. This caused the cloud to miss sweeps that formed mid-candle, while index.html
+        // (which calls all 5 functions on every tick) caught them. Now we mirror index.html's handlePrice
+        // behavior exactly: updateCB + updateSess + updateZones + detectSweeps + updateBias + scanSig
+        // on every WebSocket message.
         const candleKey = Math.floor(k.t / 60000 / 15);
         const existing = e.c15[e.c15.length - 1];
         
         if (!existing || existing.key !== candleKey) {
-          // New candle — add it
+          // New 15m candle — add it
           e.c15.push({
             key: candleKey,
             o: parseFloat(k.o) + offset,
@@ -277,41 +415,41 @@ function connect(e) {
             t: new Date(k.t)
           });
           if (e.c15.length > 100) e.c15.shift();
-          if (e.c15.length >= 5) {
-            detectSwings(e); updateZones(e); updateBias(e);
-            e.atr = calcAtr(e);
-          }
         } else {
-          // Update existing candle
+          // Update existing candle — high/low/close
           existing.h = Math.max(existing.h, parseFloat(k.h) + offset);
           existing.l = Math.min(existing.l, parseFloat(k.l) + offset);
           existing.c = parseFloat(k.c) + offset;
         }
         
-        // Always set price and run scan
+        // Always set price
         e.prev = e.price; e.price = price;
         e.ph.push({ t: new Date(), p: price });
         if (e.ph.length > 500) e.ph.shift();
         
+        // Run ALL detection functions on every tick (matches index.html handlePrice exactly)
+        // This is critical — detectSweeps must run on every tick to catch mid-candle sweeps
         if (e.c15.length >= 5) {
-          try { scanSig(e, CONFIG.minGrade, onSignal); } catch (err) { console.error(`[${e.symbol}] scanSig error:`, err.message); }
+          try {
+            detectSwings(e);
+            updateZones(e);
+            detectSweeps(e);
+            updateBias(e);
+            scanSig(e, CONFIG.minGrade, onSignal);
+          } catch (err) { console.error(`[${e.symbol}] scanSig error:`, err.message); }
         } else {
           e.signal = { action: 'WAIT', reason: `Building candles (${e.c15.length}/5)` };
         }
       } else if (d.p) {
         // Fallback: trade stream format (if kline not available)
         const price = parseFloat(d.p);
-        handlePrice(e, price, offsetMap[e.symbol] || 0);
-        scanSig(e, CONFIG.minGrade, onSignal);
-        // Mirror to Sniper engine too
+        // M8 fix: pass minGrade + onSignal so handlePrice can fire Telegram pushes
+        handlePrice(e, price, offsetMap[e.symbol] || 0, CONFIG.minGrade, onSignal);
+        // Mirror to Sniper engine too (CRITICAL FIX: pass callback, no duplicate scanSig)
         const sniperE = sniperBySymbol[e.symbol];
         if (sniperE) {
           try {
-            SniperEngine.handlePrice(sniperE, price, offsetMap[e.symbol] || 0);
-            const sniperResult = SniperEngine.scanSig(sniperE);
-            if (sniperResult && (sniperResult.action === 'LONG' || sniperResult.action === 'SHORT')) {
-              onSniperSignal(sniperE, sniperResult);
-            }
+            SniperEngine.handlePrice(sniperE, price, offsetMap[e.symbol] || 0, onSniperSignal);
           } catch (sniperErr) {
             console.error(`[SNIPER:${e.symbol}] trade-stream scan error:`, sniperErr.message);
           }
@@ -336,6 +474,78 @@ function connect(e) {
     e._heartbeatInterval = setInterval(() => {
       if (e.lhb && Date.now() - e.lhb > 45000) {
         console.log(`[${e.symbol}] No heartbeat in 45s — forcing reconnect`);
+        try { ws.terminate(); } catch (ex) {}
+      }
+    }, 15000);
+  }
+}
+
+// ===== CL WEBSOCKET CONNECTION (5m kline stream — separate from V2's 15m) =====
+// CL engine needs 5m candles, so it has its own WebSocket connection per instrument.
+// ISOLATED from V2's connect() function — separate sockets, separate message handling.
+function connectCL(e) {
+  // XAG (Silver) is on Binance Futures — use fstream.binance.com
+  // BTC/XAU/EUR are on Binance Spot — use stream.binance.com:9443
+  const host = e.config && e.config.futures ? 'fstream.binance.com' : 'stream.binance.com:9443';
+  const url = `wss://${host}/ws/${e.stream}@kline_5m`;
+  console.log(`[CL:${e.symbol}] Connecting to ${url}${e.config && e.config.futures ? ' (futures)' : ' (spot)'}`);
+  const ws = new WebSocket(url);
+  clSockets[e.symbol] = ws;
+
+  ws.on('open', () => {
+    console.log(`[CL:${e.symbol}] ✓ Connected (live, 5m kline stream${e.config && e.config.futures ? ', futures' : ', spot'})`);
+    // If not bootstrapped yet, try now
+    if (e.ltf.length === 0) {
+      CleanEngine.bootstrap(e, offsetMap[e.symbol] || 0);
+    }
+  });
+
+  ws.on('message', (data) => {
+    try {
+      const d = JSON.parse(data.toString());
+      if (d.k) {
+        const offset = offsetMap[e.symbol] || 0;
+        // === UPDATE SHARED DATA LAYER ===
+        // Push this 5m kline to the shared cache so all engines see the same data.
+        marketData.updateFromWebSocket(e.symbol, '5m', d.k, offset);
+        // Sync CL's 1h HTF + 1d PDH/PDL from shared cache (in case market-data refreshed)
+        CleanEngine.syncFromCache(e);
+        // CRITICAL: pass onCLOutcome callback so lifecycle events (filled/tp1/tp2/stopped/etc.) fire
+        // Without this, only the SETUP notification would ever fire — no trade management alerts.
+        const status = CleanEngine.handleKline(e, d.k, offset, onCLOutcome);
+        // Only run scan on candle close (too expensive to run on every tick)
+        if (status === 'closed') {
+          try {
+            const minGrade = process.env.CL_MIN_GRADE || 'B';
+            const newsClear = process.env.CL_NEWS_CLEAR === 'true';
+            const setup = CleanEngine.runScan(e, minGrade, newsClear);
+            if (setup) {
+              onCLSignal(e, setup);
+            }
+          } catch (clErr) {
+            console.error(`[CL:${e.symbol}] scan error:`, clErr.message);
+          }
+        }
+      }
+    } catch (ex) {
+      // ignore parse errors
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[CL:${e.symbol}] WS error:`, err.message);
+  });
+
+  ws.on('close', () => {
+    console.log(`[CL:${e.symbol}] WS closed — reconnecting in ${CONFIG.reconnectDelay}ms`);
+    setTimeout(() => connectCL(e), CONFIG.reconnectDelay);
+  });
+
+  // Heartbeat check for CL
+  if (!e._clHeartbeat) {
+    e._clHeartbeat = setInterval(() => {
+      if (e.lhb && Date.now() - e.lhb > 45000) {
+        console.log(`[CL:${e.symbol}] No heartbeat in 45s — forcing reconnect`);
         try { ws.terminate(); } catch (ex) {}
       }
     }, 15000);
@@ -373,15 +583,83 @@ const server = http.createServer(async (req, res) => {
       reason: e.signal ? e.signal.reason : '',
       swept: e.swept.length
     }));
+    const clStatus = clEngines.map(e => ({
+      symbol: e.symbol + '-CL',
+      price: e.price,
+      bias: e.an ? e.an.bias : '—',
+      ltfCount: e.ltf.length,
+      htfCount: e.htf.length,
+      hasDaily: !!e.daily,
+      hasSetup: !!(e.an && e.an.setup),
+      setupGrade: (e.an && e.an.setup) ? e.an.setup.grade : null,
+      setupDir: (e.an && e.an.setup) ? e.an.setup.dir : null,
+      seenCount: Object.keys(e.seen).length,
+      wsState: clSockets[e.symbol] ? clSockets[e.symbol].readyState : 'closed',
+      status: e.status
+    }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       uptime: process.uptime(),
       engines: status,
       sniperEngines: sniperStatus,
+      clEngines: clStatus,
       journalSize: journal.length,
-      sniperJournalSize: sniperJournal.length
+      sniperJournalSize: sniperJournal.length,
+      clJournalSize: clJournal.length,
+      marketData: {
+        callCount: marketData.getCallCount(),
+        cacheStats: marketData.getStats()
+      }
     }, null, 2));
+    return;
+  }
+
+  if (req.url === '/market-data') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      callCount: marketData.getCallCount(),
+      cacheStats: marketData.getStats()
+    }, null, 2));
+    return;
+  }
+
+  if (req.url === '/debug-cl') {
+    const status = clEngines.map(e => ({
+      symbol: e.symbol,
+      price: e.price,
+      rawPrice: e.rawPrice,
+      ltfCount: e.ltf.length,
+      htfCount: e.htf.length,
+      daily: e.daily,
+      bias: e.an ? e.an.bias : '—',
+      asia: e.an ? e.an.asia : null,
+      atr: e.an ? e.an.atr : null,
+      setup: e.an && e.an.setup ? {
+        dir: e.an.setup.dir,
+        grade: e.an.setup.grade,
+        score: e.an.setup.score,
+        entry: e.an.setup.entry,
+        stop: e.an.setup.stop,
+        tp1: e.an.setup.tp1,
+        tp2: e.an.setup.tp2,
+        trigger: e.an.setup.trigger,
+        sweep: e.an.setup.sweep.label,
+        poi: e.an.setup.poi,
+        fresh: e.an.setup.fresh,
+        mitigated: e.an.setup.mitigated,
+        checks: e.an.setup.checks
+      } : null,
+      watch: e.an && e.an.watch ? {
+        dir: e.an.watch.dir,
+        poolLabel: e.an.watch.poolLabel,
+        level: e.an.watch.level
+      } : null,
+      seenCount: Object.keys(e.seen).length,
+      lastScan: e.lastScan ? new Date(e.lastScan).toISOString() : null
+    }));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', clEngines: status, journal: clJournal.slice(-10) }, null, 2));
     return;
   }
 
@@ -548,44 +826,62 @@ server.listen(PORT, HOST, () => {
   console.log(`HTTP:  http://${HOST}:${PORT}/health`);
   console.log(`Telegram: ${CONFIG.telegramChatIds.length} recipient(s): ${CONFIG.telegramChatIds.join(', ')}`);
   console.log(`Grade: ${CONFIG.minGrade}-only filter (Engine V2)`);
-  console.log(`Engine V2: BTC + XAU + ETH + EUR (15m, 3/4 bias, 60-min sweep)`);
+  console.log(`Engine V2: BTC + XAU + XAG + EUR (15m, 3/4 bias, 60-min sweep)`);
   console.log(`Engine SNIPER: BTC + XAU only (15m, 4/4 bias, 30-min sweep) — isolated`);
+  console.log(`Engine CL: BTC + XAU + XAG + EUR (5m, 9-point checklist, FVG/OB, 1h HTF bias) — isolated, own WS`);
   console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}, XAG=${offsetMap.XAG}, EUR=${offsetMap.EUR}`);
   console.log(`========================================\n`);
 
-  // Bootstrap all V2 engines, then connect WebSockets
-  // STAGGER: 15 seconds between instruments to stay under TwelveData's 8 calls/min limit
-  // Each instrument makes 2 calls (15m + daily) = 8 total. With 15s gaps, that's ~1 min.
+  // === SHARED DATA LAYER BOOTSTRAP ===
+  // market-data.js fetches 5m + 15m + 1h + 1d for ALL 4 instruments (BTC, XAU, XAG, EUR) in one pass.
+  // Total: 16 REST calls at startup, then 0 for 5m/15m (WebSocket), 96/day for 1h, 48/day for 1d.
+  // All 3 engines (V2, Sniper, CL) read from this shared cache.
   (async () => {
+    console.log(`\n[${new Date().toISOString()}] Bootstrapping shared market-data layer...`);
+    await marketData.bootstrapAll(offsetMap);
+    console.log(`[${new Date().toISOString()}] Shared data layer ready. Starting scheduled refresh jobs...`);
+    marketData.startScheduledRefresh(offsetMap);
+    console.log(`[${new Date().toISOString()}] Scheduled refresh jobs started.\n`);
+
+    // === BOOTSTRAP V2 ENGINES (read from shared cache) ===
     for (const e of engines) {
       await bootstrap(e, offsetMap[e.symbol] || 0);
-      connect(e);
-      // 15 second gap between instruments (TwelveData: 8 calls/min, we make 2 per instrument)
-      await new Promise(r => setTimeout(r, 15000));
+      connect(e);  // V2 connects its own 15m WebSocket
+      await new Promise(r => setTimeout(r, 2000));  // 2s gap between WS connections
     }
-    console.log(`\n[${new Date().toISOString()}] All V2 engines connected. Watching for signals...`);
+    console.log(`[${new Date().toISOString()}] All V2 engines connected. Watching for signals...`);
 
-    // === BOOTSTRAP SNIPER ENGINES (BTC + XAU only) ===
-    // Stagger after V2 to avoid TwelveData rate limit (need 2 more calls: BTC + XAU)
+    // === BOOTSTRAP SNIPER ENGINES (read from shared cache — no extra REST calls) ===
     if (!sniperBootstrapped) {
       sniperBootstrapped = true;
       for (const se of sniperEngines) {
         await SniperEngine.bootstrap(se, offsetMap[se.symbol] || 0);
-        // 15s gap to stay under TwelveData 8/min
-        await new Promise(r => setTimeout(r, 15000));
+        await new Promise(r => setTimeout(r, 1000));
       }
-      console.log(`[${new Date().toISOString()}] SNIPER engines bootstrapped (BTC + XAU).`);
+      console.log(`[${new Date().toISOString()}] SNIPER engines bootstrapped (BTC + XAU) from shared cache.`);
       console.log(`[SNIPER] Now receiving mirrored ticks from V2 WebSocket connections.`);
       console.log(`[SNIPER] Signals will push to Telegram with [SNIPER] prefix.\n`);
     }
+
+    // === BOOTSTRAP CL ENGINES (read from shared cache — no extra REST calls) ===
+    if (!clBootstrapped) {
+      clBootstrapped = true;
+      for (const ce of clEngines) {
+        await CleanEngine.bootstrap(ce, offsetMap[ce.symbol] || 0);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      console.log(`[${new Date().toISOString()}] CL engines bootstrapped (BTC + XAU + XAG + EUR) from shared cache.`);
+      // Now connect CL's own 5m WebSocket for each instrument
+      clEngines.forEach(ce => connectCL(ce));
+      console.log(`[CL] 5m WebSocket connections established.`);
+      console.log(`[CL] Signals will push to Telegram with "CL BTC SELL" / "CL XAU BUY" / "CL XAG SELL" / "CL EUR BUY" prefix.\n`);
+    }
   })();
 
-  // Periodic maintenance every 5 min: refresh 1H + retry bootstrap if needed
-  // V2 maintenance
+  // Periodic maintenance every 5 min: retry bootstrap if engines have low candle count
+  // No more REST calls here — market-data.js handles all refreshes via scheduled jobs.
   setInterval(() => {
     engines.forEach(e => {
-      refreshHtf(e, offsetMap[e.symbol] || 0);
-      // Retry bootstrap if we don't have enough candles
       if (e.c15.length < 50) {
         const now = Date.now();
         if (!e._lastBootstrapRetry || now - e._lastBootstrapRetry > 300000) {
@@ -595,7 +891,6 @@ server.listen(PORT, HOST, () => {
         }
       }
     });
-    // Sniper maintenance — only retry bootstrap if low candles
     sniperEngines.forEach(se => {
       if (se.c15.length < 50) {
         const now = Date.now();
@@ -606,20 +901,36 @@ server.listen(PORT, HOST, () => {
         }
       }
     });
+    clEngines.forEach(ce => {
+      if (ce.ltf.length < 80 || ce.htf.length < 20 || !ce.daily) {
+        const now = Date.now();
+        if (!ce._lastBootstrapRetry || now - ce._lastBootstrapRetry > 300000) {
+          ce._lastBootstrapRetry = now;
+          console.log(`[CL:${ce.symbol}] Periodic bootstrap retry (ltf=${ce.ltf.length}, htf=${ce.htf.length})`);
+          CleanEngine.bootstrap(ce, offsetMap[ce.symbol] || 0);
+        }
+      }
+    });
+    // Log market-data call count for monitoring
+    const calls = marketData.getCallCount();
+    console.log(`[MarketData] Call count: ${calls.total} total (${JSON.stringify(calls.byType)})`);
   }, 300000);
 
-  // Status log every 5 minutes — both engines
+  // Status log every 5 minutes — all three engines + market-data stats
   setInterval(() => {
     const v2status = engines.map(e => `${e.symbol}:c15=${e.c15.length}/${e.bias}`).join(' ');
     const snipStatus = sniperEngines.map(e => `${e.symbol}:c15=${e.c15.length}/${e.bias}`).join(' ');
-    console.log(`[status ${new Date().toISOString().slice(11, 19)}] V2: ${v2status} | SNIPER: ${snipStatus}`);
+    const clStatus = clEngines.map(e => `${e.symbol}:ltf=${e.ltf.length}/htf=${e.htf.length}/${e.an ? e.an.bias : '—'}`).join(' ');
+    console.log(`[status ${new Date().toISOString().slice(11, 19)}] V2: ${v2status} | SNIPER: ${snipStatus} | CL: ${clStatus}`);
   }, 300000);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received — closing sockets...');
+  marketData.stopScheduledRefresh();
   Object.values(sockets).forEach(ws => { try { ws.close(); } catch (e) {} });
+  Object.values(clSockets).forEach(ws => { try { ws.close(); } catch (e) {} });
   server.close(() => process.exit(0));
 });
 process.on('SIGINT', () => process.exit(0));
