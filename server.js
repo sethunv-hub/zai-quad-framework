@@ -51,10 +51,10 @@ const clSockets = {}; // separate socket map for CL 5m connections
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
 const CONFIG = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '9149020873:AAGiPgSRSWBThcu0lJERnQQvVEVLNaNR2io',
-  // Comma-separated list of chat IDs - all will receive every signal
-  // To add a recipient: have them start @ZaiQuadBot, get their ID from @userinfobot,
-  // then add it here (comma-separated) or set TELEGRAM_CHAT_IDS env var
-  telegramChatIds: (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || '8855264786')
+  // Telegram recipients — hardcoded list of chat IDs
+  // Both you (8855264786) and your wife (8840047976) receive every signal
+  // To add more recipients later, append their chat ID with a comma (no spaces)
+  telegramChatIds: (process.env.TELEGRAM_CHAT_IDS || '8855264786,8840047976')
     .split(',')
     .map(id => id.trim())
     .filter(id => id.length > 0),
