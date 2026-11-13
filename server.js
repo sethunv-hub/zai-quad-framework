@@ -33,14 +33,13 @@ let sniperBootstrapped = false;
 
 // ===== CL ENGINE (Engine C) — runs in parallel, ISOLATED from V2 + Sniper =====
 // This is the EXACT logic from cl-btc-xau.html (5m LTF, 1h HTF, 1d daily, 9-point checklist)
-// Instruments: BTC + XAU + XAG + EUR (expanded per user request)
-// Push format: "CL BTC SELL" / "CL XAU BUY" / "CL XAG SELL" / "CL EUR BUY"
+// Instruments: BTC + XAU + EUR (XAG removed — TwelveData free tier doesn't support XAG/USD)
+// Push format: "CL BTC SELL" / "CL XAU BUY" / "CL EUR BUY"
 // Has its OWN WebSocket connection (5m kline stream) — does NOT share with V2/Sniper
 const CleanEngine = require('./smc-engine-cl');
 const clEngines = [
   CleanEngine.makeCLEngine('BTC', 'btcusdt', { futures: false, weekendSuppress: false }),
   CleanEngine.makeCLEngine('XAU', 'paxgusdt', { futures: false, weekendSuppress: false }),
-  CleanEngine.makeCLEngine('XAG', 'xagusdt', { futures: true,  weekendSuppress: false }),  // Silver on Binance Futures
   CleanEngine.makeCLEngine('EUR', 'eurusdt', { futures: false, weekendSuppress: true  })   // Forex — closed weekends
 ];
 const clBySymbol = {};
@@ -83,11 +82,6 @@ const engines = [
     roundStars: 1, riskWidePct: 0.008, breakoutTh: 0.0015, pullbackTh: 0.005,
     roundStep: 100, weekendSuppress: false, futures: false    // C1 fix: matches index.html — PAXG trades 24/7 on Binance, no weekend suppression
   }),
-  makeEngine('XAG', 'xagusdt', {
-    prefix: 'silver', slBuffer: 0.05, minRisk: 0.10, maxRisk: 0.50,
-    roundStars: 2, riskWidePct: 0.015, breakoutTh: 0.003, pullbackTh: 0.007,
-    roundStep: 1, weekendSuppress: false, futures: true   // Silver on Binance Futures (matches index.html line 425)
-  }),
   makeEngine('EUR', 'eurusdt', {
     prefix: 'eur', slBuffer: 0.0008, minRisk: 0.0008, maxRisk: 0.0050,
     roundStars: 3, riskWidePct: 0.008, breakoutTh: 0.0005, pullbackTh: 0.002,
@@ -97,7 +91,7 @@ const engines = [
 
 const offsetMap = {
   BTC: CONFIG.btcOffset, XAU: CONFIG.goldOffset,
-  XAG: CONFIG.silverOffset, EUR: CONFIG.eurOffset
+  XAG: CONFIG.silverOffset, EUR: CONFIG.eurOffset  // XAG kept for offset endpoint compat, but no engine uses it
 };
 
 // ===== TELEGRAM PUSH =====
@@ -141,7 +135,7 @@ async function sendToChat(chatId, text) {
 
 // ===== SIGNAL HANDLER — fires when a valid signal passes all filters =====
 async function onSignal(e, sig) {
-  const nameMap = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' };
+  const nameMap = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' };
   const instShort = nameMap[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
@@ -152,7 +146,7 @@ async function onSignal(e, sig) {
   const account = parseFloat(process.env.ACCOUNT_SIZE || '500');
   const riskPct = parseFloat(process.env.RISK_PCT || '0.5');
   const riskUsd = account * riskPct / 100;
-  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'XAU' ? 100 : e.symbol === 'XAG' ? 100 : 100000;  // XAG: 100 oz per lot (typical silver contract)
+  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'XAU' ? 100 : 100000;  // EUR: 100,000 units per lot (standard forex lot)
   const lotsRaw = riskUsd / (sig.zoneRisk * contractSize);
   // Fallback: if lots rounds to 0 (risk too tight), use minimum 0.01 lots
   const lots = Math.max(0.01, Math.floor(lotsRaw * 100) / 100);
@@ -202,7 +196,7 @@ function curSessName() {
 // ===== SNIPER SIGNAL HANDLER (Engine B) — pushes to Telegram with [SNIPER] prefix =====
 // ISOLATED from V2's onSignal. Separate function, separate state, separate prefix.
 async function onSniperSignal(e, sig) {
-  const instShort = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const instShort = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' }[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
   // [SNIPER] prefix distinguishes these signals from V2's [V2] signals
@@ -241,7 +235,7 @@ const sniperJournal = [];
 // Format EXACTLY matches cl-btc-xau.html (per user request):
 //   "CL BTC SELL\nEntry: ...\nSL: ...\nTP: ... / ...\nTime: ... PHT\nTrigger: ...\nSweep: ..."
 async function onCLSignal(e, setup) {
-  const instShort = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const instShort = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' }[e.symbol] || e.symbol;
   const dir = setup.dir === 'long' ? 'BUY' : 'SELL';
   const emoji = setup.dir === 'long' ? '📈' : '📉';
   // Title starts with "CL BTC SELL" / "CL XAU BUY" — exactly as user requested
@@ -281,7 +275,7 @@ const clJournal = [];
 // Port of cl-btc-xau.html EV map (lines 563-574) + notify() function (line 576)
 // Fires on: filled, tp1, tp2, be, stopped, missed, invalid, expired
 async function onCLOutcome(e, outcomeType, sig) {
-  const instShort = { BTC: 'BTC', XAU: 'XAU', XAG: 'XAG', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const instShort = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' }[e.symbol] || e.symbol;
   const dir = sig.dir === 'long' ? 'BUY' : 'SELL';
   const phtStr = CleanEngine.fmtPht(Date.now());
 
@@ -772,7 +766,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Update offset endpoint: POST /offset/BTC/50.5
-  const offsetMatch = req.url.match(/^\/offset\/(BTC|XAU|XAG|EUR)\/(-?[\d.]+)$/);
+  const offsetMatch = req.url.match(/^\/offset\/(BTC|XAU|EUR)\/(-?[\d.]+)$/);
   if (offsetMatch) {
     const sym = offsetMatch[1];
     const off = parseFloat(offsetMatch[2]);
@@ -826,14 +820,14 @@ server.listen(PORT, HOST, () => {
   console.log(`HTTP:  http://${HOST}:${PORT}/health`);
   console.log(`Telegram: ${CONFIG.telegramChatIds.length} recipient(s): ${CONFIG.telegramChatIds.join(', ')}`);
   console.log(`Grade: ${CONFIG.minGrade}-only filter (Engine V2)`);
-  console.log(`Engine V2: BTC + XAU + XAG + EUR (15m, 3/4 bias, 60-min sweep)`);
+  console.log(`Engine V2: BTC + XAU + EUR (15m, 3/4 bias, 60-min sweep)`);
   console.log(`Engine SNIPER: BTC + XAU only (15m, 4/4 bias, 30-min sweep) — isolated`);
-  console.log(`Engine CL: BTC + XAU + XAG + EUR (5m, 9-point checklist, FVG/OB, 1h HTF bias) — isolated, own WS`);
-  console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}, XAG=${offsetMap.XAG}, EUR=${offsetMap.EUR}`);
+  console.log(`Engine CL: BTC + XAU + EUR (5m, 9-point checklist, FVG/OB, 1h HTF bias) — isolated, own WS`);
+  console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}, EUR=${offsetMap.EUR}`);
   console.log(`========================================\n`);
 
   // === SHARED DATA LAYER BOOTSTRAP ===
-  // market-data.js fetches 5m + 15m + 1h + 1d for ALL 4 instruments (BTC, XAU, XAG, EUR) in one pass.
+  // market-data.js fetches 5m + 15m + 1h + 1d for ALL 3 instruments (BTC, XAU, EUR) in one pass.
   // Total: 16 REST calls at startup, then 0 for 5m/15m (WebSocket), 96/day for 1h, 48/day for 1d.
   // All 3 engines (V2, Sniper, CL) read from this shared cache.
   (async () => {
@@ -870,11 +864,11 @@ server.listen(PORT, HOST, () => {
         await CleanEngine.bootstrap(ce, offsetMap[ce.symbol] || 0);
         await new Promise(r => setTimeout(r, 1000));
       }
-      console.log(`[${new Date().toISOString()}] CL engines bootstrapped (BTC + XAU + XAG + EUR) from shared cache.`);
+      console.log(`[${new Date().toISOString()}] CL engines bootstrapped (BTC + XAU + EUR) from shared cache.`);
       // Now connect CL's own 5m WebSocket for each instrument
       clEngines.forEach(ce => connectCL(ce));
       console.log(`[CL] 5m WebSocket connections established.`);
-      console.log(`[CL] Signals will push to Telegram with "CL BTC SELL" / "CL XAU BUY" / "CL XAG SELL" / "CL EUR BUY" prefix.\n`);
+      console.log(`[CL] Signals will push to Telegram with "CL BTC SELL" / "CL XAU BUY" / "CL EUR BUY" prefix.\n`);
     }
   })();
 
