@@ -335,11 +335,11 @@ function updateBias(e) {
     var structureAgrees = (mb === 'bullish' && sb === 'bullish') || (mb === 'bearish' && sb === 'bearish');
     var macroAgrees = (mb === 'bullish' && mBull) || (mb === 'bearish' && mBear);
     var macroNeutral = !mBull && !mBear;
-    // LOOSENED CT FILTER: Allow momentum to flip bias even against macro trend
-    // Tag as counter-trend (lower strength=2) so the engine knows it's higher risk
-    // Previously: BLOCKED flip entirely → missed all reversal trades on BTC/Gold/Silver
-    // Now: ALLOW flip with reduced strength → signals can fire on reversals
-    if (structureAgrees || macroAgrees || macroNeutral || mb !== 'neutral') {
+    // TIGHTENED CT FILTER: Only allow momentum to flip bias when structure OR macro agrees.
+    // Previously: || macroNeutral || mb !== 'neutral' (too loose — fired false reversals in strong trends)
+    // Now: Only flip if swing structure agrees OR macro trend agrees with the momentum direction.
+    // This blocks "3 green candles in a downtrend" false reversals that caused repeated SL hits.
+    if (structureAgrees || macroAgrees) {
       bias = mb;
       var isCT = !macroAgrees;
       st = isCT ? 2 : Math.max(st, 3);
