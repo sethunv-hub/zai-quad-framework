@@ -126,7 +126,7 @@ function bootPD(e) {
   if (f) { e.pdh = ph; e.pdl = pl; }
 }
 
-function handlePrice(e, price, offset, minGrade, onSignal) {
+function handlePrice(e, price, offset, minGrade, onSignal, onOutcome) {
   if (!price || price < 0.5 || price > 1000000) return;
   const adj = offset !== 0 ? price + offset : price;
   e.prev = e.price; e.price = adj;
@@ -148,6 +148,11 @@ function handlePrice(e, price, offset, minGrade, onSignal) {
     updateZones(e); detectSweeps(e); updateBias(e);
     // M8 fix: pass minGrade + onSignal through so signals fire the Telegram push
     scanSig(e, minGrade, onSignal);
+    // LIFECYCLE TRACKING: track active signal for fill/tp/stop/missed/invalid events
+    // Ported from CL engine — gives V2 the same trade management notifications as CL.
+    if (e.actSig && onOutcome) {
+      trackSignal(e, adj, 'forming', null, onOutcome);
+    }
   } catch (err) {
     console.error(`[${e.symbol}] handlePrice error:`, err.message);
   }
@@ -642,7 +647,100 @@ function syncPdhPdl(e) {
   }
 }
 
+// ===== LIFECYCLE TRACKING (ported from CL engine) =====
+// Gives V2 the same trade management notifications as CL:
+// filled, tp1, tp2, stopped, missed, invalid, expired
+// Called from handlePrice on every tick when there's an active signal.
+
+const sigDir = sig => sig.action === 'LONG';
+const fillHit = (g, h, l) => sigDir(g) ? l <= g.entry : h >= g.entry;
+const stopHit = (g, h, l) => sigDir(g) ? l <= g.sl : h >= g.sl;
+const tpHit = (g, p, h, l) => sigDir(g) ? h >= p : l <= p;
+
+function trackSignal(e, price, mode, bar, onOutcome) {
+  const g = e.actSig; if (!g) return;
+  const h = price, l = price; // tick-level — use current price as both h and l
+  const isLong = sigDir(g);
+
+  // Initialize lifecycle fields if not set
+  if (!g.status) {
+    g.status = 'pending';
+    g.age = 0;
+    g.filledAt = null;
+    g.fillBarT = null;
+    // MFE/MAE tracking — how far price went favorable/adverse from entry
+    g.maxFavorable = null;  // best price in trade direction (highest for LONG, lowest for SHORT)
+    g.maxAdverse = null;    // worst price against trade (lowest for LONG, highest for SHORT)
+  }
+
+  // Update MFE/MAE on every tick (track from signal creation, not just after fill)
+  if (isLong) {
+    // LONG: favorable = price goes UP, adverse = price goes DOWN
+    if (g.maxFavorable === null || price > g.maxFavorable) g.maxFavorable = price;
+    if (g.maxAdverse === null || price < g.maxAdverse) g.maxAdverse = price;
+  } else {
+    // SHORT: favorable = price goes DOWN, adverse = price goes UP
+    if (g.maxFavorable === null || price < g.maxFavorable) g.maxFavorable = price;
+    if (g.maxAdverse === null || price > g.maxAdverse) g.maxAdverse = price;
+  }
+
+  if (g.status === 'pending') {
+    const filled = fillHit(g, h, l);
+    if (mode === 'closed') {
+      g.age++;
+      if (!filled) {
+        const broke = sigDir(g) ? (bar && bar.c < g.sl) : (bar && bar.c > g.sl);
+        if (tpHit(g, g.tp1, h, l)) return finishSignal(e, 'missed', 0, onOutcome);
+        if (broke) return finishSignal(e, 'invalid', 0, onOutcome);
+        if (g.age >= 40) return finishSignal(e, 'expired', 0, onOutcome);
+      }
+    }
+    if (filled) {
+      g.status = 'open';
+      g.filledAt = Date.now();
+      if (onOutcome) onOutcome(e, 'filled', g);
+      if (stopHit(g, h, l)) return finishSignal(e, 'stopped', -1, onOutcome);
+    }
+    return;
+  }
+  if (mode === 'forming') return;
+  if (mode === 'closed' && bar && bar.t <= (g.fillBarT || 0)) return;
+  if (g.status === 'open') {
+    if (stopHit(g, h, l)) return finishSignal(e, 'stopped', -1, onOutcome);
+    if (g.tp1 && tpHit(g, g.tp1, h, l)) {
+      g.status = 'tp1';
+      if (onOutcome) onOutcome(e, 'tp1', g);
+      if (g.tp2 && tpHit(g, g.tp2, h, l)) {
+        var r1 = g.rr1 || 1, r2 = g.rr2 || 2;
+        return finishSignal(e, 'tp2', 0.5 * r1 + 0.5 * r2, onOutcome);
+      }
+    }
+    return;
+  }
+  if (g.status === 'tp1') {
+    if (fillHit(g, h, l)) {
+      var r1 = g.rr1 || 1;
+      return finishSignal(e, 'be', 0.5 * r1, onOutcome);
+    }
+    if (g.tp2 && tpHit(g, g.tp2, h, l)) {
+      var r1b = g.rr1 || 1, r2b = g.rr2 || 2;
+      return finishSignal(e, 'tp2', 0.5 * r1b + 0.5 * r2b, onOutcome);
+    }
+  }
+}
+
+function finishSignal(e, result, r, onOutcome) {
+  const sig = e.actSig; if (!sig) return;
+  sig.status = result;
+  sig.outcomeR = r;
+  sig.closedAt = Date.now();
+  if (onOutcome) onOutcome(e, result, sig);
+  // Clear actSig so scanSig can create a new signal
+  e.actSig = null;
+  e.lockUntil = 0;
+}
+
 module.exports = {
-  makeEngine, bootstrap, refreshHtf, syncPdhPdl, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend,
-  detectSwings, detectSweeps, updateZones, updateBias
+  makeEngine, bootstrap, refreshHtf, syncPdhPdl, handlePrice, scanSig, trackSignal, finishSignal,
+  fmtPht, fmtPrice, isFxWeekend, detectSwings, detectSweeps, updateZones, updateBias
 };

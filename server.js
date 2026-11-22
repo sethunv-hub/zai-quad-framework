@@ -3,7 +3,7 @@
 // No dashboard. No browser. Just signals to your phone.
 
 const WebSocket = require('ws');
-const { makeEngine, bootstrap, refreshHtf, syncPdhPdl, handlePrice, scanSig, fmtPht, fmtPrice, isFxWeekend, htfBias, detectSwings, detectSweeps, updateZones, updateBias } = require('./smc-engine');
+const { makeEngine, bootstrap, refreshHtf, syncPdhPdl, handlePrice, scanSig, trackSignal, fmtPht, fmtPrice, isFxWeekend, htfBias, detectSwings, detectSweeps, updateZones, updateBias } = require('./smc-engine');
 
 // ===== SHARED DATA LAYER =====
 // market-data.js is the SINGLE source of truth for all candle data.
@@ -20,10 +20,10 @@ const marketData = require('./market-data');
 const SniperEngine = require('./smc-engine-sniper');
 const sniperEngines = [
   SniperEngine.makeSniperEngine('BTC', 'btcusdt', {
-    slBuffer: 50, minRisk: 150, maxRisk: 3000
+    slBuffer: 150, minRisk: 150, maxRisk: 3000
   }),
   SniperEngine.makeSniperEngine('XAU', 'paxgusdt', {
-    slBuffer: 2.5, minRisk: 6, maxRisk: 30
+    slBuffer: 5.0, minRisk: 6, maxRisk: 30
   })
 ];
 // Map for quick lookup by symbol — used to mirror ticks from V2's WebSocket into Sniper engines
@@ -31,16 +31,12 @@ const sniperBySymbol = {};
 sniperEngines.forEach(e => { sniperBySymbol[e.symbol] = e; });
 let sniperBootstrapped = false;
 
-// ===== CL ENGINE (Engine C) — runs in parallel, ISOLATED from V2 + Sniper =====
-// This is the EXACT logic from cl-btc-xau.html (5m LTF, 1h HTF, 1d daily, 9-point checklist)
-// Instruments: BTC + XAU + EUR (XAG removed — TwelveData free tier doesn't support XAG/USD)
-// Push format: "CL BTC SELL" / "CL XAU BUY" / "CL EUR BUY"
-// Has its OWN WebSocket connection (5m kline stream) — does NOT share with V2/Sniper
+// ===== CL ENGINE (Engine C) — BTC + XAU only =====
+// EUR removed — Binance EURUSDT price diverges too much from Exness EURUSD (100+ pip gap)
 const CleanEngine = require('./smc-engine-cl');
 const clEngines = [
   CleanEngine.makeCLEngine('BTC', 'btcusdt', { futures: false, weekendSuppress: false }),
-  CleanEngine.makeCLEngine('XAU', 'paxgusdt', { futures: false, weekendSuppress: false }),
-  CleanEngine.makeCLEngine('EUR', 'eurusdt', { futures: false, weekendSuppress: true  })   // Forex — closed weekends
+  CleanEngine.makeCLEngine('XAU', 'paxgusdt', { futures: false, weekendSuppress: false })
 ];
 const clBySymbol = {};
 clEngines.forEach(e => { clBySymbol[e.symbol] = e; });
@@ -70,28 +66,24 @@ const CONFIG = {
   reconnectDelay: 2000
 };
 
-// ===== ENGINES — same config as the HTML version =====
+// ===== ENGINES — BTC + XAU only (EUR removed — data gap too large) =====
+// SL buffers widened 2026-11-20: BTC 50→150, XAU 2.5→5.0
+// Old buffers were too tight — trades hit SL on normal pullbacks before the move played out.
 const engines = [
   makeEngine('BTC', 'btcusdt', {
-    prefix: 'btc', slBuffer: 50, minRisk: 150, maxRisk: 3000,
+    prefix: 'btc', slBuffer: 150, minRisk: 150, maxRisk: 3000,
     roundStars: 2, riskWidePct: 0.008, breakoutTh: 0.003, pullbackTh: 0.01,
     roundStep: 1000, weekendSuppress: false, futures: false
   }),
   makeEngine('XAU', 'paxgusdt', {
-    prefix: 'gold', slBuffer: 2.5, minRisk: 6, maxRisk: 30,
+    prefix: 'gold', slBuffer: 5.0, minRisk: 6, maxRisk: 30,
     roundStars: 1, riskWidePct: 0.008, breakoutTh: 0.0015, pullbackTh: 0.005,
-    roundStep: 100, weekendSuppress: false, futures: false    // C1 fix: matches index.html — PAXG trades 24/7 on Binance, no weekend suppression
-  }),
-  makeEngine('EUR', 'eurusdt', {
-    prefix: 'eur', slBuffer: 0.0008, minRisk: 0.0008, maxRisk: 0.0050,
-    roundStars: 3, riskWidePct: 0.008, breakoutTh: 0.0005, pullbackTh: 0.002,
-    roundStep: 0.01, weekendSuppress: true, futures: false
+    roundStep: 100, weekendSuppress: false, futures: false
   })
 ];
 
 const offsetMap = {
-  BTC: CONFIG.btcOffset, XAU: CONFIG.goldOffset,
-  XAG: CONFIG.silverOffset, EUR: CONFIG.eurOffset  // XAG kept for offset endpoint compat, but no engine uses it
+  BTC: CONFIG.btcOffset, XAU: CONFIG.goldOffset
 };
 
 // ===== TELEGRAM PUSH =====
@@ -135,7 +127,7 @@ async function sendToChat(chatId, text) {
 
 // ===== SIGNAL HANDLER — fires when a valid signal passes all filters =====
 async function onSignal(e, sig) {
-  const nameMap = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' };
+  const nameMap = { BTC: 'BTC', XAU: 'XAU' };
   const instShort = nameMap[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
@@ -146,7 +138,7 @@ async function onSignal(e, sig) {
   const account = parseFloat(process.env.ACCOUNT_SIZE || '500');
   const riskPct = parseFloat(process.env.RISK_PCT || '0.5');
   const riskUsd = account * riskPct / 100;
-  const contractSize = e.symbol === 'BTC' ? 1 : e.symbol === 'XAU' ? 100 : 100000;  // EUR: 100,000 units per lot (standard forex lot)
+  const contractSize = e.symbol === 'BTC' ? 1 : 100;  // XAU: 100 oz per lot
   const lotsRaw = riskUsd / (sig.zoneRisk * contractSize);
   // Fallback: if lots rounds to 0 (risk too tight), use minimum 0.01 lots
   const lots = Math.max(0.01, Math.floor(lotsRaw * 100) / 100);
@@ -181,6 +173,8 @@ Risk: ${fmtPrice(e.symbol, sig.zoneRisk)} | Account: $${riskUsd.toFixed(0)} → 
     outcome: 'pending'
   });
   if (journal.length > 200) journal.shift();
+  // Also log to unified trade journal for weekly review with lifecycle tracking
+  logTradeEntry('V2', e, sig);
 }
 
 const journal = [];
@@ -193,10 +187,220 @@ function curSessName() {
   return null;
 }
 
+// ===== UNIFIED TRADE JOURNAL =====
+// Every signal from V2, Sniper, and CL is logged here with full lifecycle tracking.
+// Each entry records: setup details → fill status → outcome (TP/SL/missed/invalid/expired)
+// Export via /journal endpoint for weekly review.
+const tradeJournal = [];
+
+function logTradeEntry(engine, e, sig) {
+  const entry = {
+    id: `${engine}-${e.symbol}-${Date.now()}`,
+    engine: engine,
+    instrument: e.symbol,
+    direction: sig.action === 'LONG' ? 'BUY' : 'SELL',
+    grade: sig.quality,
+    entry: sig.entry,
+    sl: sig.sl,
+    tp1: sig.tp1,
+    tp2: sig.tp2 || null,
+    tp3: sig.tp3 || null,
+    rr1: sig.rr1,
+    rr2: sig.rr2 || null,
+    rr3: sig.rr3 || null,
+    zoneRisk: sig.zoneRisk || sig.risk || null,
+    trigger: sig.trigger || null,
+    sweep: sig.sweep ? (sig.sweep.name || sig.sweep.label) : null,
+    bias: e.bias,
+    session: curSessName(),
+    createdAt: new Date().toISOString(),
+    // Lifecycle fields (updated as trade progresses)
+    status: 'pending',
+    filledAt: null,
+    filledPrice: null,
+    outcome: null,        // 'tp1', 'tp2', 'be', 'stopped', 'missed', 'invalid', 'expired'
+    outcomeR: null,       // R multiple of outcome
+    outcomePrice: null,   // price at which outcome occurred
+    closedAt: null
+  };
+  tradeJournal.push(entry);
+  if (tradeJournal.length > 500) tradeJournal.shift();
+  return entry;
+}
+
+function updateTradeOutcome(engine, e, outcomeType, sig) {
+  // Find the most recent pending/open trade for this engine + instrument
+  for (let i = tradeJournal.length - 1; i >= 0; i--) {
+    const t = tradeJournal[i];
+    if (t.engine === engine && t.instrument === e.symbol && t.status !== 'tp2' && t.status !== 'stopped' && t.status !== 'be' && t.status !== 'missed' && t.status !== 'invalid' && t.status !== 'expired') {
+      // Update lifecycle
+      if (outcomeType === 'filled') {
+        t.status = 'open';
+        t.filledAt = new Date().toISOString();
+        t.filledPrice = e.price;
+      } else if (outcomeType === 'tp1') {
+        t.status = 'tp1';
+        t.outcome = 'tp1';
+        t.outcomePrice = e.price;
+      } else if (outcomeType === 'tp2') {
+        t.status = 'tp2';
+        t.outcome = 'tp2';
+        t.outcomeR = sig.outcomeR || sig.r;
+        t.outcomePrice = e.price;
+        t.closedAt = new Date().toISOString();
+      } else if (outcomeType === 'be') {
+        t.status = 'be';
+        t.outcome = 'be';
+        t.outcomeR = sig.outcomeR || sig.r;
+        t.closedAt = new Date().toISOString();
+      } else if (outcomeType === 'stopped') {
+        t.status = 'stopped';
+        t.outcome = 'stopped';
+        t.outcomeR = -1;
+        t.outcomePrice = e.price;
+        t.closedAt = new Date().toISOString();
+      } else if (outcomeType === 'missed') {
+        t.status = 'missed';
+        t.outcome = 'missed';
+        t.closedAt = new Date().toISOString();
+      } else if (outcomeType === 'invalid') {
+        t.status = 'invalid';
+        t.outcome = 'invalid';
+        t.closedAt = new Date().toISOString();
+      } else if (outcomeType === 'expired') {
+        t.status = 'expired';
+        t.outcome = 'expired';
+        t.closedAt = new Date().toISOString();
+      }
+
+      // === MFE/MAE TRACKING — capture how far price went before the trade closed ===
+      // This tells you: "the trade went 0.8R in the right direction before reversing to SL"
+      // Critical for tuning SL/TP placement.
+      if (sig.maxFavorable !== null && sig.maxAdverse !== null && t.entry && t.sl) {
+        const isLong = t.direction === 'BUY';
+        const riskDist = Math.abs(t.entry - t.sl);  // 1R in price terms
+        if (riskDist > 0) {
+          // MFE = how far price went in the favorable direction (in R)
+          const favorableDist = isLong
+            ? (sig.maxFavorable - t.entry)    // LONG: maxFavorable is highest price
+            : (t.entry - sig.maxFavorable);   // SHORT: maxFavorable is lowest price
+          t.mfePrice = sig.maxFavorable;
+          t.mfeR = favorableDist / riskDist;  // e.g., 0.8 = went 80% of the way to TP1
+
+          // MAE = how far price went against the trade (in R)
+          const adverseDist = isLong
+            ? (t.entry - sig.maxAdverse)      // LONG: maxAdverse is lowest price
+            : (sig.maxAdverse - t.entry);     // SHORT: maxAdverse is highest price
+          t.maePrice = sig.maxAdverse;
+          t.maeR = adverseDist / riskDist;    // e.g., 0.3 = went 30% toward SL before recovering
+
+          // For stopped trades: did it almost reach TP1 first?
+          if (outcomeType === 'stopped' && t.tp1) {
+            const tp1Dist = isLong
+              ? (t.tp1 - t.entry)             // LONG: TP1 is above entry
+              : (t.entry - t.tp1);            // SHORT: TP1 is below entry
+            if (tp1Dist > 0) {
+              t.mfeToTp1Pct = (favorableDist / tp1Dist * 100);  // e.g., 85% = got 85% of the way to TP1
+            }
+          }
+        }
+      }
+
+      break;
+    }
+  }
+}
+
+// ===== V2 OUTCOME HANDLER — lifecycle notifications for V2 signals =====
+async function onV2Outcome(e, outcomeType, sig) {
+  const instShort = e.symbol;
+  const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
+  const phtStr = fmtPht(Date.now());
+
+  let title = '', msg = '';
+  switch (outcomeType) {
+    case 'filled':
+      title = `✅ [V2] ${instShort} ${dir} entry reached`;
+      msg = `Price tapped ${fmtPrice(e.symbol, sig.entry)}. SL ${fmtPrice(e.symbol, sig.sl)} | TP1 ${fmtPrice(e.symbol, sig.tp1)} | Time: ${phtStr}`;
+      break;
+    case 'tp1':
+      title = `🎯 [V2] ${instShort} TP1 hit`;
+      msg = `TP1 ${fmtPrice(e.symbol, sig.tp1)} reached. Consider partial + move SL to break-even. | Time: ${phtStr}`;
+      break;
+    case 'tp2':
+      title = `🏆 [V2] ${instShort} TP2 hit +${(sig.outcomeR || 0).toFixed(2)}R`;
+      msg = `Full target ${fmtPrice(e.symbol, sig.tp2)} reached. | Time: ${phtStr}`;
+      break;
+    case 'stopped':
+      title = `❌ [V2] ${instShort} ${dir} stopped -1R`;
+      msg = `Stop ${fmtPrice(e.symbol, sig.sl)} hit. | Time: ${phtStr}`;
+      break;
+    case 'missed':
+      title = `⏳ [V2] ${instShort} ${dir} setup missed`;
+      msg = `Price reached TP1 without filling entry. Do not chase. | Time: ${phtStr}`;
+      break;
+    case 'invalid':
+      title = `🚫 [V2] ${instShort} ${dir} invalidated`;
+      msg = `Price closed beyond stop before filling. Cancelled. | Time: ${phtStr}`;
+      break;
+    case 'expired':
+      title = `⌛ [V2] ${instShort} ${dir} expired`;
+      msg = `Entry not reached within 40 bars. Cancelled. | Time: ${phtStr}`;
+      break;
+    default: return;
+  }
+  console.log(`\n[${new Date().toISOString()}] ${title}`);
+  await sendNtfy(title, msg);
+  updateTradeOutcome('V2', e, outcomeType, sig);
+}
+
+// ===== SNIPER OUTCOME HANDLER — lifecycle notifications for Sniper signals =====
+async function onSniperOutcome(e, outcomeType, sig) {
+  const instShort = e.symbol;
+  const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
+  const phtStr = SniperEngine.fmtPht(Date.now());
+
+  let title = '', msg = '';
+  switch (outcomeType) {
+    case 'filled':
+      title = `✅ [SNIPER] ${instShort} ${dir} entry reached`;
+      msg = `Price tapped ${SniperEngine.fmtPrice(e.symbol, sig.entry)}. SL ${SniperEngine.fmtPrice(e.symbol, sig.sl)} | TP1 ${SniperEngine.fmtPrice(e.symbol, sig.tp1)} | Time: ${phtStr}`;
+      break;
+    case 'tp1':
+      title = `🎯 [SNIPER] ${instShort} TP1 hit`;
+      msg = `TP1 ${SniperEngine.fmtPrice(e.symbol, sig.tp1)} reached. Consider partial + move SL to break-even. | Time: ${phtStr}`;
+      break;
+    case 'tp2':
+      title = `🏆 [SNIPER] ${instShort} TP2 hit +${(sig.outcomeR || 0).toFixed(2)}R`;
+      msg = `Full target ${SniperEngine.fmtPrice(e.symbol, sig.tp2)} reached. | Time: ${phtStr}`;
+      break;
+    case 'stopped':
+      title = `❌ [SNIPER] ${instShort} ${dir} stopped -1R`;
+      msg = `Stop ${SniperEngine.fmtPrice(e.symbol, sig.sl)} hit. | Time: ${phtStr}`;
+      break;
+    case 'missed':
+      title = `⏳ [SNIPER] ${instShort} ${dir} setup missed`;
+      msg = `Price reached TP1 without filling entry. Do not chase. | Time: ${phtStr}`;
+      break;
+    case 'invalid':
+      title = `🚫 [SNIPER] ${instShort} ${dir} invalidated`;
+      msg = `Price closed beyond stop before filling. Cancelled. | Time: ${phtStr}`;
+      break;
+    case 'expired':
+      title = `⌛ [SNIPER] ${instShort} ${dir} expired`;
+      msg = `Entry not reached within 40 bars. Cancelled. | Time: ${phtStr}`;
+      break;
+    default: return;
+  }
+  console.log(`\n[${new Date().toISOString()}] ${title}`);
+  await sendNtfy(title, msg);
+  updateTradeOutcome('SNIPER', e, outcomeType, sig);
+}
+
 // ===== SNIPER SIGNAL HANDLER (Engine B) — pushes to Telegram with [SNIPER] prefix =====
 // ISOLATED from V2's onSignal. Separate function, separate state, separate prefix.
 async function onSniperSignal(e, sig) {
-  const instShort = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const instShort = { BTC: 'BTC', XAU: 'XAU' }[e.symbol] || e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const emoji = sig.action === 'LONG' ? '📈' : '📉';
   // [SNIPER] prefix distinguishes these signals from V2's [V2] signals
@@ -227,6 +431,8 @@ Risk: ${SniperEngine.fmtPrice(e.symbol, sig.zoneRisk)}`;
     bias: e.bias, session: SniperEngine.curSess(), outcome: 'pending'
   });
   if (sniperJournal.length > 200) sniperJournal.shift();
+  // Also log to unified trade journal for weekly review with lifecycle tracking
+  logTradeEntry('SNIPER', e, sig);
 }
 const sniperJournal = [];
 
@@ -235,7 +441,7 @@ const sniperJournal = [];
 // Format EXACTLY matches cl-btc-xau.html (per user request):
 //   "CL BTC SELL\nEntry: ...\nSL: ...\nTP: ... / ...\nTime: ... PHT\nTrigger: ...\nSweep: ..."
 async function onCLSignal(e, setup) {
-  const instShort = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const instShort = { BTC: 'BTC', XAU: 'XAU' }[e.symbol] || e.symbol;
   const dir = setup.dir === 'long' ? 'BUY' : 'SELL';
   const emoji = setup.dir === 'long' ? '📈' : '📉';
   // Title starts with "CL BTC SELL" / "CL XAU BUY" — exactly as user requested
@@ -268,6 +474,24 @@ Sweep: ${setup.sweep.label}`;
     outcome: 'pending'
   });
   if (clJournal.length > 200) clJournal.shift();
+  // Also log to unified trade journal for weekly review with lifecycle tracking
+  // CL uses setup.dir instead of sig.action, and setup.stop instead of sig.sl
+  logTradeEntry('CL', e, {
+    action: setup.dir === 'long' ? 'LONG' : 'SHORT',
+    quality: setup.grade,
+    entry: setup.entry,
+    sl: setup.stop,
+    tp1: setup.tp1,
+    tp2: setup.tp2,
+    tp3: null,
+    rr1: setup.rr1,
+    rr2: setup.rr2,
+    rr3: null,
+    zoneRisk: setup.risk,
+    trigger: setup.trigger,
+    sweep: { name: setup.sweep.label },
+    confidence: setup.score
+  });
 }
 const clJournal = [];
 
@@ -275,7 +499,7 @@ const clJournal = [];
 // Port of cl-btc-xau.html EV map (lines 563-574) + notify() function (line 576)
 // Fires on: filled, tp1, tp2, be, stopped, missed, invalid, expired
 async function onCLOutcome(e, outcomeType, sig) {
-  const instShort = { BTC: 'BTC', XAU: 'XAU', EUR: 'EUR' }[e.symbol] || e.symbol;
+  const instShort = { BTC: 'BTC', XAU: 'XAU' }[e.symbol] || e.symbol;
   const dir = sig.dir === 'long' ? 'BUY' : 'SELL';
   const phtStr = CleanEngine.fmtPht(Date.now());
 
@@ -368,13 +592,11 @@ function connect(e) {
         // === MIRROR TICK TO SNIPER ENGINE (Engine B) ===
         // Feed the same tick into the corresponding Sniper engine (if exists)
         // CRITICAL FIX: pass onSniperSignal as callback so scanSig can fire the Telegram push directly.
-        // Previously this called handlePrice() then scanSig() again — but handlePrice already calls
-        // scanSig internally, and the second call would always return undefined (because e.actSig
-        // was already set by the first call). This made the Sniper engine completely silent.
+        // Also pass onSniperOutcome so lifecycle events (filled/tp/stop) fire for Sniper too.
         const sniperE = sniperBySymbol[e.symbol];
         if (sniperE) {
           try {
-            SniperEngine.handlePrice(sniperE, parseFloat(k.c), offset, onSniperSignal);
+            SniperEngine.handlePrice(sniperE, parseFloat(k.c), offset, onSniperSignal, onSniperOutcome);
           } catch (sniperErr) {
             console.error(`[SNIPER:${e.symbol}] scan error:`, sniperErr.message);
           }
@@ -430,6 +652,10 @@ function connect(e) {
             detectSweeps(e);
             updateBias(e);
             scanSig(e, CONFIG.minGrade, onSignal);
+            // LIFECYCLE TRACKING: track active V2 signal for fill/tp/stop events
+            if (e.actSig) {
+              trackSignal(e, price, 'forming', null, onV2Outcome);
+            }
           } catch (err) { console.error(`[${e.symbol}] scanSig error:`, err.message); }
         } else {
           e.signal = { action: 'WAIT', reason: `Building candles (${e.c15.length}/5)` };
@@ -437,13 +663,13 @@ function connect(e) {
       } else if (d.p) {
         // Fallback: trade stream format (if kline not available)
         const price = parseFloat(d.p);
-        // M8 fix: pass minGrade + onSignal so handlePrice can fire Telegram pushes
-        handlePrice(e, price, offsetMap[e.symbol] || 0, CONFIG.minGrade, onSignal);
-        // Mirror to Sniper engine too (CRITICAL FIX: pass callback, no duplicate scanSig)
+        // Pass minGrade + onSignal + onV2Outcome so handlePrice can fire Telegram pushes + lifecycle events
+        handlePrice(e, price, offsetMap[e.symbol] || 0, CONFIG.minGrade, onSignal, onV2Outcome);
+        // Mirror to Sniper engine too (pass onSniperOutcome for lifecycle tracking)
         const sniperE = sniperBySymbol[e.symbol];
         if (sniperE) {
           try {
-            SniperEngine.handlePrice(sniperE, price, offsetMap[e.symbol] || 0, onSniperSignal);
+            SniperEngine.handlePrice(sniperE, price, offsetMap[e.symbol] || 0, onSniperSignal, onSniperOutcome);
           } catch (sniperErr) {
             console.error(`[SNIPER:${e.symbol}] trade-stream scan error:`, sniperErr.message);
           }
@@ -479,7 +705,7 @@ function connect(e) {
 // ISOLATED from V2's connect() function — separate sockets, separate message handling.
 function connectCL(e) {
   // XAG (Silver) is on Binance Futures — use fstream.binance.com
-  // BTC/XAU/EUR are on Binance Spot — use stream.binance.com:9443
+  // BTC/XAU are on Binance Spot — use stream.binance.com:9443
   const host = e.config && e.config.futures ? 'fstream.binance.com' : 'stream.binance.com:9443';
   const url = `wss://${host}/ws/${e.stream}@kline_5m`;
   console.log(`[CL:${e.symbol}] Connecting to ${url}${e.config && e.config.futures ? ' (futures)' : ' (spot)'}`);
@@ -657,6 +883,35 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ===== UNIFIED TRADE JOURNAL ENDPOINT =====
+  // Returns all tracked trades with full lifecycle data for weekly review.
+  // Access via: /journal or /journal?engine=V2 or /journal?outcome=stopped
+  if (req.url.startsWith('/journal')) {
+    const urlObj = new URL(req.url, 'http://localhost');
+    const engineFilter = urlObj.searchParams.get('engine');
+    const outcomeFilter = urlObj.searchParams.get('outcome');
+    let trades = tradeJournal.slice();
+    if (engineFilter) trades = trades.filter(t => t.engine === engineFilter.toUpperCase());
+    if (outcomeFilter) trades = trades.filter(t => t.outcome === outcomeFilter.toLowerCase());
+    // Summary stats
+    const total = trades.length;
+    const byOutcome = {};
+    trades.forEach(t => {
+      const o = t.outcome || 'pending';
+      byOutcome[o] = (byOutcome[o] || 0) + 1;
+    });
+    const byEngine = {};
+    trades.forEach(t => {
+      byEngine[t.engine] = (byEngine[t.engine] || 0) + 1;
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      summary: { total, byOutcome, byEngine },
+      trades: trades.reverse()  // newest first
+    }, null, 2));
+    return;
+  }
+
   if (req.url === '/debug-sniper') {
     const status = sniperEngines.map(e => ({
       symbol: e.symbol,
@@ -766,7 +1021,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Update offset endpoint: POST /offset/BTC/50.5
-  const offsetMatch = req.url.match(/^\/offset\/(BTC|XAU|EUR)\/(-?[\d.]+)$/);
+  const offsetMatch = req.url.match(/^\/offset\/(BTC|XAU)\/(-?[\d.]+)$/);
   if (offsetMatch) {
     const sym = offsetMatch[1];
     const off = parseFloat(offsetMatch[2]);
@@ -820,14 +1075,14 @@ server.listen(PORT, HOST, () => {
   console.log(`HTTP:  http://${HOST}:${PORT}/health`);
   console.log(`Telegram: ${CONFIG.telegramChatIds.length} recipient(s): ${CONFIG.telegramChatIds.join(', ')}`);
   console.log(`Grade: ${CONFIG.minGrade}-only filter (Engine V2)`);
-  console.log(`Engine V2: BTC + XAU + EUR (15m, 3/4 bias, 60-min sweep)`);
+  console.log(`Engine V2: BTC + XAU (15m, 3/4 bias, 60-min sweep)`);
   console.log(`Engine SNIPER: BTC + XAU only (15m, 4/4 bias, 30-min sweep) — isolated`);
-  console.log(`Engine CL: BTC + XAU + EUR (5m, 9-point checklist, FVG/OB, 1h HTF bias) — isolated, own WS`);
-  console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}, EUR=${offsetMap.EUR}`);
+  console.log(`Engine CL: BTC + XAU (5m, 9-point checklist, FVG/OB, 1h HTF bias) — isolated, own WS`);
+  console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}`);
   console.log(`========================================\n`);
 
   // === SHARED DATA LAYER BOOTSTRAP ===
-  // market-data.js fetches 5m + 15m + 1h + 1d for ALL 3 instruments (BTC, XAU, EUR) in one pass.
+  // market-data.js fetches 5m + 15m + 1h + 1d for ALL 2 instruments (BTC, XAU) in one pass.
   // Total: 16 REST calls at startup, then 0 for 5m/15m (WebSocket), 96/day for 1h, 48/day for 1d.
   // All 3 engines (V2, Sniper, CL) read from this shared cache.
   (async () => {
@@ -864,11 +1119,11 @@ server.listen(PORT, HOST, () => {
         await CleanEngine.bootstrap(ce, offsetMap[ce.symbol] || 0);
         await new Promise(r => setTimeout(r, 1000));
       }
-      console.log(`[${new Date().toISOString()}] CL engines bootstrapped (BTC + XAU + EUR) from shared cache.`);
+      console.log(`[${new Date().toISOString()}] CL engines bootstrapped (BTC + XAU) from shared cache.`);
       // Now connect CL's own 5m WebSocket for each instrument
       clEngines.forEach(ce => connectCL(ce));
       console.log(`[CL] 5m WebSocket connections established.`);
-      console.log(`[CL] Signals will push to Telegram with "CL BTC SELL" / "CL XAU BUY" / "CL EUR BUY" prefix.\n`);
+      console.log(`[CL] Signals will push to Telegram with "CL BTC SELL" / "CL XAU BUY" prefix.\n`);
     }
   })();
 
