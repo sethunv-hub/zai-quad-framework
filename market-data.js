@@ -27,17 +27,17 @@
 'use strict';
 
 const TWELVEDATA_KEY = process.env.TWELVEDATA_KEY || '2577565126b44bf2bdff2d25e5f957f0';
-const TWELVEDATA_SYMBOLS = { BTC: 'BTC/USD', XAU: 'XAU/USD', EUR: 'EUR/USD' };
-// NOTE: XAG (Silver) removed — TwelveData free tier doesn't support XAG/USD.
-// To re-add Silver: upgrade TwelveData to Grow plan ($29/mo), then add 'XAG': 'XAG/USD' back.
+const TWELVEDATA_SYMBOLS = { BTC: 'BTC/USD', XAU: 'XAU/USD' };
+// EUR removed — Binance EURUSDT diverges 100+ pips from Exness EURUSD.
+// XAG removed — TwelveData free tier doesn't support XAG/USD.
 
 // ===== IN-MEMORY CACHE =====
 // Structure: cache[symbol][timeframe] = array of {t, o, h, l, c, v}
 // Timeframes: '5m', '15m', '1h', '1d'
 // Daily also stored as cache[symbol].daily = { pdh, pdl } for convenience
 const cache = {};
-const SYMBOLS = ['BTC', 'XAU', 'EUR'];
-// XAG removed — TwelveData free tier returns 401 for XAG/USD.
+const SYMBOLS = ['BTC', 'XAU'];
+// EUR + XAG removed — see TWELVEDATA_SYMBOLS comment above.
 SYMBOLS.forEach(s => {
   cache[s] = { '5m': [], '15m': [], '1h': [], '1d': [], daily: null, lastBootstrap: 0 };
 });
