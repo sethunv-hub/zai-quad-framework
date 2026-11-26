@@ -153,6 +153,10 @@ Risk: ${fmtPrice(e.symbol, sig.zoneRisk)} | Account: $${riskUsd.toFixed(0)} → 
   console.log(`\n[${new Date().toISOString()}] ${title}`);
   console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
 
+  // CRITICAL: log to trade journal BEFORE async sendNtfy — must be synchronous
+  // so the entry exists when trackSignal runs microseconds later
+  logTradeEntry('V2', e, sig);
+
   await sendNtfy(title, msg);
 
   // Log to journal
@@ -173,8 +177,6 @@ Risk: ${fmtPrice(e.symbol, sig.zoneRisk)} | Account: $${riskUsd.toFixed(0)} → 
     outcome: 'pending'
   });
   if (journal.length > 200) journal.shift();
-  // Also log to unified trade journal for weekly review with lifecycle tracking
-  logTradeEntry('V2', e, sig);
 }
 
 const journal = [];
@@ -350,8 +352,9 @@ async function onV2Outcome(e, outcomeType, sig) {
     default: return;
   }
   console.log(`\n[${new Date().toISOString()}] ${title}`);
-  await sendNtfy(title, msg);
+  // CRITICAL: update trade journal BEFORE async sendNtfy — must be synchronous
   updateTradeOutcome('V2', e, outcomeType, sig);
+  await sendNtfy(title, msg);
 }
 
 // ===== SNIPER OUTCOME HANDLER — lifecycle notifications for Sniper signals =====
@@ -393,8 +396,9 @@ async function onSniperOutcome(e, outcomeType, sig) {
     default: return;
   }
   console.log(`\n[${new Date().toISOString()}] ${title}`);
-  await sendNtfy(title, msg);
+  // CRITICAL: update trade journal BEFORE async sendNtfy — must be synchronous
   updateTradeOutcome('SNIPER', e, outcomeType, sig);
+  await sendNtfy(title, msg);
 }
 
 // ===== SNIPER SIGNAL HANDLER (Engine B) — pushes to Telegram with [SNIPER] prefix =====
@@ -417,7 +421,9 @@ Risk: ${SniperEngine.fmtPrice(e.symbol, sig.zoneRisk)}`;
   console.log(`\n[${new Date().toISOString()}] ${title}`);
   console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
 
-  // Push to Telegram (same channel as V2, but with [SNIPER] prefix to distinguish)
+  // CRITICAL: log to trade journal BEFORE async sendNtfy — must be synchronous
+  logTradeEntry('SNIPER', e, sig);
+
   await sendNtfy(title, msg);
 
   // Log to separate sniper journal (kept separate from V2's journal)
@@ -431,8 +437,6 @@ Risk: ${SniperEngine.fmtPrice(e.symbol, sig.zoneRisk)}`;
     bias: e.bias, session: SniperEngine.curSess(), outcome: 'pending'
   });
   if (sniperJournal.length > 200) sniperJournal.shift();
-  // Also log to unified trade journal for weekly review with lifecycle tracking
-  logTradeEntry('SNIPER', e, sig);
 }
 const sniperJournal = [];
 
@@ -458,23 +462,7 @@ Sweep: ${setup.sweep.label}`;
   console.log(`\n[${new Date().toISOString()}] ${title}`);
   console.log(`  ${msg.replace(/\n/g, '\n  ')}\n`);
 
-  // Push to Telegram (same channel as V2 + Sniper, but with CL prefix to distinguish)
-  await sendNtfy(title, msg);
-
-  // Log to separate CL journal
-  clJournal.push({
-    timestamp: new Date().toISOString(),
-    instrument: e.symbol, action: setup.dir === 'long' ? 'LONG' : 'SHORT',
-    grade: setup.grade, score: setup.score,
-    entry: setup.entry, sl: setup.stop,
-    tp1: setup.tp1, tp2: setup.tp2,
-    rr1: setup.rr1, rr2: setup.rr2, risk: setup.risk,
-    sweep: setup.sweep.label, trigger: setup.trigger, poi: setup.poi,
-    htfBias: e.an ? e.an.bias : null, formedAt: setup.formedAt,
-    outcome: 'pending'
-  });
-  if (clJournal.length > 200) clJournal.shift();
-  // Also log to unified trade journal for weekly review with lifecycle tracking
+  // CRITICAL: log to trade journal BEFORE async sendNtfy — must be synchronous
   // CL uses setup.dir instead of sig.action, and setup.stop instead of sig.sl
   logTradeEntry('CL', e, {
     action: setup.dir === 'long' ? 'LONG' : 'SHORT',
@@ -492,6 +480,22 @@ Sweep: ${setup.sweep.label}`;
     sweep: { name: setup.sweep.label },
     confidence: setup.score
   });
+
+  await sendNtfy(title, msg);
+
+  // Log to separate CL journal
+  clJournal.push({
+    timestamp: new Date().toISOString(),
+    instrument: e.symbol, action: setup.dir === 'long' ? 'LONG' : 'SHORT',
+    grade: setup.grade, score: setup.score,
+    entry: setup.entry, sl: setup.stop,
+    tp1: setup.tp1, tp2: setup.tp2,
+    rr1: setup.rr1, rr2: setup.rr2, risk: setup.risk,
+    sweep: setup.sweep.label, trigger: setup.trigger, poi: setup.poi,
+    htfBias: e.an ? e.an.bias : null, formedAt: setup.formedAt,
+    outcome: 'pending'
+  });
+  if (clJournal.length > 200) clJournal.shift();
 }
 const clJournal = [];
 
@@ -545,10 +549,13 @@ async function onCLOutcome(e, outcomeType, sig) {
   console.log(`\n[${new Date().toISOString()}] ${title}`);
   console.log(`  ${msg}\n`);
 
+  // CRITICAL: update trade journal BEFORE async sendNtfy — must be synchronous
+  updateTradeOutcome('CL', e, outcomeType, sig);
+
   // Push to Telegram
   await sendNtfy(title, msg);
 
-  // Update journal entry — find the original setup in clJournal and mark outcome
+  // Update CL-specific journal entry
   // (match by instrument + formedAt timestamp)
   for (let i = clJournal.length - 1; i >= 0; i--) {
     if (clJournal[i].instrument === e.symbol && clJournal[i].formedAt === sig.formedAt) {
