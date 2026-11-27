@@ -1,17 +1,27 @@
-// server.js — ZAI QUAD FRAMEWORK cloud server
-// Runs 24/7 on Render. Connects to Binance WebSockets, evaluates SMC signals, pushes Telegram alerts.
-// No dashboard. No browser. Just signals to your phone.
+// server.js — ZAI QUAD FRAMEWORK cloud server (Exness-native market data)
+// Runs 24/7 on Render. Connects to Exness WebSocket + REST, evaluates SMC signals, pushes Telegram alerts.
+// No Binance. No TwelveData. No offset calculation. Exness IS the broker — prices are correct as-is.
 
-const WebSocket = require('ws');
 const { makeEngine, bootstrap, refreshHtf, syncPdhPdl, handlePrice, scanSig, trackSignal, fmtPht, fmtPrice, isFxWeekend, htfBias, detectSwings, detectSweeps, updateZones, updateBias } = require('./smc-engine');
 
 // ===== SHARED DATA LAYER =====
 // market-data.js is the SINGLE source of truth for all candle data.
 // All 3 engines (V2, Sniper, CL) read from this cache — no engine makes its own REST calls.
-// 5m/15m update in real-time via WebSockets (free, unlimited).
-// 1h refreshes at :00:05 every hour. 1d refreshes every 2 hours.
-// Total: ~160 REST calls/day (vs ~2,496 before — 94% reduction).
+//   - REST bootstrap: M5 + M15 + H1 + D1 for BTCUSD + XAUUSD from Exness (8 calls at startup)
+//   - 5m + 15m: live-built from Exness WebSocket ticks (no REST cost after bootstrap)
+//   - 1h refreshes at :00:05 every hour (2 calls/hour)
+//   - 1d refreshes every 2 hours (2 calls/2h)
+// Total: ~8 startup + ~48 1h/day + ~24 1d/day = ~80 REST calls/day — well under Exness limits.
 const marketData = require('./market-data');
+
+// ===== EXNESS API (native market data source) =====
+// Provides:
+//   - REST candle fetcher (Ed25519-signed GET /v1/market-data/accounts/{id}/candles)
+//   - WebSocket tick stream (wss://{host}/v1/server-events/accounts/{id}/ws/ticks)
+//   - Auto-reconnect with exponential backoff
+//   - Health check via /v1/accounts/{id}/balance
+// No more dynamic offset calculation — Exness IS the broker, prices are already correct.
+const exnessAPI = require('./exness-api');
 
 // ===== SNIPER ENGINE (Engine B) — runs in parallel, ISOLATED from V2 =====
 // This is the EXACT logic from smc-signals-mobile.html (4/4 bias, 30-min sweep lookback)
@@ -26,7 +36,7 @@ const sniperEngines = [
     slBuffer: 5.0, minRisk: 6, maxRisk: 30
   })
 ];
-// Map for quick lookup by symbol — used to mirror ticks from V2's WebSocket into Sniper engines
+// Map for quick lookup by symbol — used to route Exness ticks into Sniper engines
 const sniperBySymbol = {};
 sniperEngines.forEach(e => { sniperBySymbol[e.symbol] = e; });
 let sniperBootstrapped = false;
@@ -41,7 +51,6 @@ const clEngines = [
 const clBySymbol = {};
 clEngines.forEach(e => { clBySymbol[e.symbol] = e; });
 let clBootstrapped = false;
-const clSockets = {}; // separate socket map for CL 5m connections
 
 // ===== CONFIGURATION =====
 // All configurable via environment variables (set in fly.toml or `fly secrets set`)
@@ -57,13 +66,6 @@ const CONFIG = {
   // Legacy single chat ID kept for backwards compatibility
   get telegramChatId() { return this.telegramChatIds[0]; },
   minGrade: process.env.MIN_GRADE || 'A',          // A, AB, or ABC
-  // Per-instrument Exness offsets — set via env vars or fetch from a config endpoint
-  btcOffset: parseFloat(process.env.BTC_OFFSET || '0'),
-  goldOffset: parseFloat(process.env.GOLD_OFFSET || '0'),
-  silverOffset: parseFloat(process.env.SILVER_OFFSET || '0'),
-  eurOffset: parseFloat(process.env.EUR_OFFSET || '0'),
-  // Reconnect delay (ms) if WebSocket drops
-  reconnectDelay: 2000
 };
 
 // ===== ENGINES — BTC + XAU only (EUR removed — data gap too large) =====
@@ -82,9 +84,9 @@ const engines = [
   })
 ];
 
-const offsetMap = {
-  BTC: CONFIG.btcOffset, XAU: CONFIG.goldOffset
-};
+// Engine lookup by symbol — used to route Exness ticks into V2 engines
+const engineBySymbol = {};
+engines.forEach(e => { engineBySymbol[e.symbol] = e; });
 
 // ===== TELEGRAM PUSH =====
 // Unlimited messages, no daily quota, instant delivery
@@ -567,215 +569,142 @@ async function onCLOutcome(e, outcomeType, sig) {
   }
 }
 
-// ===== WEBSOCKET CONNECTIONS — use kline stream for candle data =====
-const sockets = {};
+// ===== EXNESS WEBSOCKET TICK HANDLER =====
+// This is the SINGLE entry point for all real-time price data.
+// exnessAPI.connectTicks() calls onExnessTick(instrument, bid, ask, timestamp) on every tick.
+// Each tick:
+//   1. Updates the shared market-data cache (5m + 15m candles built live, price updated)
+//   2. Feeds the bid price into V2's handlePrice → updateCB → 15m build → detect → scanSig → track
+//   3. Feeds the bid price into Sniper's handlePrice (same pipeline, isolated state)
+//   4. For CL: calls handleKline on every tick (forming mode) for lifecycle tracking,
+//      and additionally on a 5m close (closed mode) to push to e.ltf and run scan
+//
+// All three engines now share the SAME tick source — no more Binance WS, no more mirroring.
+// Exness IS the broker — bid price is the actual executable price, no offset needed.
 
-function connect(e) {
-  const host = e.config.futures ? 'fstream.binance.com' : 'stream.binance.com:9443';
-  // Use kline stream instead of trade stream — gives us full candle data
-  const url = `wss://${host}/ws/${e.stream}@kline_15m`;
+// Map Exness instrument name → internal symbol used by all engines
+const EXNESS_TO_INTERNAL = { BTCUSD: 'BTC', XAUUSD: 'XAU' };
 
-  console.log(`[${e.symbol}] Connecting to ${url}`);
-  const ws = new WebSocket(url);
-  sockets[e.symbol] = ws;
-
-  ws.on('open', () => {
-    console.log(`[${e.symbol}] ✓ Connected (live, kline stream)`);
-    // Try REST bootstrap only if c15 is empty
-    if (e.c15.length === 0) {
-      bootstrap(e, offsetMap[e.symbol] || 0);
-    }
-  });
-
-  ws.on('message', (data) => {
-    try {
-      const d = JSON.parse(data.toString());
-      // Kline stream format: { k: { t, o, h, l, c, v, x: isClosed, ... } }
-      if (d.k) {
-        const k = d.k;
-        const offset = offsetMap[e.symbol] || 0;
-        const price = parseFloat(k.c) + offset; // current price from candle close
-
-        // === MIRROR TICK TO SNIPER ENGINE (Engine B) ===
-        // Feed the same tick into the corresponding Sniper engine (if exists)
-        // CRITICAL FIX: pass onSniperSignal as callback so scanSig can fire the Telegram push directly.
-        // Also pass onSniperOutcome so lifecycle events (filled/tp/stop) fire for Sniper too.
-        const sniperE = sniperBySymbol[e.symbol];
-        if (sniperE) {
-          try {
-            SniperEngine.handlePrice(sniperE, parseFloat(k.c), offset, onSniperSignal, onSniperOutcome);
-          } catch (sniperErr) {
-            console.error(`[SNIPER:${e.symbol}] scan error:`, sniperErr.message);
-          }
-        }
-        // === END SNIPER MIRROR ===
-        
-        // === UPDATE SHARED DATA LAYER ===
-        // Push this 15m kline to the shared cache so all engines see the same data.
-        // This is a no-cost operation (in-memory) — no REST API call.
-        marketData.updateFromWebSocket(e.symbol, '15m', k, offset);
-        
-        // Sync V2's PDH/PDL from shared cache (in case market-data refreshed 1d)
-        syncPdhPdl(e);
-        
-        // === V2 ENGINE: Update candle + run all detection on EVERY tick (matches index.html behavior) ===
-        // BUG FIX (2026-11-09): Previously only called detectSweeps/updateZones/updateBias when a NEW
-        // candle started. This caused the cloud to miss sweeps that formed mid-candle, while index.html
-        // (which calls all 5 functions on every tick) caught them. Now we mirror index.html's handlePrice
-        // behavior exactly: updateCB + updateSess + updateZones + detectSweeps + updateBias + scanSig
-        // on every WebSocket message.
-        const candleKey = Math.floor(k.t / 60000 / 15);
-        const existing = e.c15[e.c15.length - 1];
-        
-        if (!existing || existing.key !== candleKey) {
-          // New 15m candle — add it
-          e.c15.push({
-            key: candleKey,
-            o: parseFloat(k.o) + offset,
-            h: parseFloat(k.h) + offset,
-            l: parseFloat(k.l) + offset,
-            c: parseFloat(k.c) + offset,
-            t: new Date(k.t)
-          });
-          if (e.c15.length > 100) e.c15.shift();
-        } else {
-          // Update existing candle — high/low/close
-          existing.h = Math.max(existing.h, parseFloat(k.h) + offset);
-          existing.l = Math.min(existing.l, parseFloat(k.l) + offset);
-          existing.c = parseFloat(k.c) + offset;
-        }
-        
-        // Always set price
-        e.prev = e.price; e.price = price;
-        e.ph.push({ t: new Date(), p: price });
-        if (e.ph.length > 500) e.ph.shift();
-        
-        // Run ALL detection functions on every tick (matches index.html handlePrice exactly)
-        // This is critical — detectSweeps must run on every tick to catch mid-candle sweeps
-        if (e.c15.length >= 5) {
-          try {
-            detectSwings(e);
-            updateZones(e);
-            detectSweeps(e);
-            updateBias(e);
-            scanSig(e, CONFIG.minGrade, onSignal);
-            // LIFECYCLE TRACKING: track active V2 signal for fill/tp/stop events
-            if (e.actSig) {
-              trackSignal(e, price, 'forming', null, onV2Outcome);
-            }
-          } catch (err) { console.error(`[${e.symbol}] scanSig error:`, err.message); }
-        } else {
-          e.signal = { action: 'WAIT', reason: `Building candles (${e.c15.length}/5)` };
-        }
-      } else if (d.p) {
-        // Fallback: trade stream format (if kline not available)
-        const price = parseFloat(d.p);
-        // Pass minGrade + onSignal + onV2Outcome so handlePrice can fire Telegram pushes + lifecycle events
-        handlePrice(e, price, offsetMap[e.symbol] || 0, CONFIG.minGrade, onSignal, onV2Outcome);
-        // Mirror to Sniper engine too (pass onSniperOutcome for lifecycle tracking)
-        const sniperE = sniperBySymbol[e.symbol];
-        if (sniperE) {
-          try {
-            SniperEngine.handlePrice(sniperE, price, offsetMap[e.symbol] || 0, onSniperSignal, onSniperOutcome);
-          } catch (sniperErr) {
-            console.error(`[SNIPER:${e.symbol}] trade-stream scan error:`, sniperErr.message);
-          }
-        }
-      }
-    } catch (ex) {
-      // ignore parse errors
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error(`[${e.symbol}] WS error:`, err.message);
-  });
-
-  ws.on('close', () => {
-    console.log(`[${e.symbol}] WS closed — reconnecting in ${CONFIG.reconnectDelay}ms`);
-    setTimeout(() => connect(e), CONFIG.reconnectDelay);
-  });
-
-  // Heartbeat check
-  if (!e._heartbeatInterval) {
-    e._heartbeatInterval = setInterval(() => {
-      if (e.lhb && Date.now() - e.lhb > 45000) {
-        console.log(`[${e.symbol}] No heartbeat in 45s — forcing reconnect`);
-        try { ws.terminate(); } catch (ex) {}
-      }
-    }, 15000);
+function onExnessTick(instrument, bid, ask, timestamp) {
+  // 1. Update shared cache + build 5m/15m candles from this tick.
+  //    Returns event info: { closed5m, forming5m, closed15m }
+  //    closed5m is non-null when a 5m candle just finished (period boundary detected).
+  let events;
+  try {
+    events = marketData.onTick(instrument, bid, ask, timestamp);
+  } catch (err) {
+    console.error('[MarketData] onTick error:', err.message);
+    return;
   }
-}
 
-// ===== CL WEBSOCKET CONNECTION (5m kline stream — separate from V2's 15m) =====
-// CL engine needs 5m candles, so it has its own WebSocket connection per instrument.
-// ISOLATED from V2's connect() function — separate sockets, separate message handling.
-function connectCL(e) {
-  // XAG (Silver) is on Binance Futures — use fstream.binance.com
-  // BTC/XAU are on Binance Spot — use stream.binance.com:9443
-  const host = e.config && e.config.futures ? 'fstream.binance.com' : 'stream.binance.com:9443';
-  const url = `wss://${host}/ws/${e.stream}@kline_5m`;
-  console.log(`[CL:${e.symbol}] Connecting to ${url}${e.config && e.config.futures ? ' (futures)' : ' (spot)'}`);
-  const ws = new WebSocket(url);
-  clSockets[e.symbol] = ws;
+  // 2. Map to internal symbol and route tick into each engine
+  const symbol = EXNESS_TO_INTERNAL[instrument];
+  if (!symbol) return; // ignore instruments we don't trade (defensive — subscription is BTCUSD+XAUUSD only)
 
-  ws.on('open', () => {
-    console.log(`[CL:${e.symbol}] ✓ Connected (live, 5m kline stream${e.config && e.config.futures ? ', futures' : ', spot'})`);
-    // If not bootstrapped yet, try now
-    if (e.ltf.length === 0) {
-      CleanEngine.bootstrap(e, offsetMap[e.symbol] || 0);
-    }
-  });
-
-  ws.on('message', (data) => {
+  // --- V2 ENGINE ---
+  // handlePrice does: updateCB (1m → 15m rollup), updateSess, updateZones, detectSweeps,
+  // updateBias, scanSig (with onSignal), trackSignal (with onV2Outcome).
+  // Pass offset=0 — Exness bid IS the broker price, no translation needed.
+  const v2E = engineBySymbol[symbol];
+  if (v2E) {
     try {
-      const d = JSON.parse(data.toString());
-      if (d.k) {
-        const offset = offsetMap[e.symbol] || 0;
-        // === UPDATE SHARED DATA LAYER ===
-        // Push this 5m kline to the shared cache so all engines see the same data.
-        marketData.updateFromWebSocket(e.symbol, '5m', d.k, offset);
-        // Sync CL's 1h HTF + 1d PDH/PDL from shared cache (in case market-data refreshed)
-        CleanEngine.syncFromCache(e);
-        // CRITICAL: pass onCLOutcome callback so lifecycle events (filled/tp1/tp2/stopped/etc.) fire
-        // Without this, only the SETUP notification would ever fire — no trade management alerts.
-        const status = CleanEngine.handleKline(e, d.k, offset, onCLOutcome);
-        // Only run scan on candle close (too expensive to run on every tick)
+      handlePrice(v2E, bid, 0, CONFIG.minGrade, onSignal, onV2Outcome);
+    } catch (err) {
+      console.error(`[V2:${symbol}] handlePrice error:`, err.message);
+    }
+  }
+
+  // --- SNIPER ENGINE ---
+  // SniperEngine.handlePrice signature: (e, price, offset, onSignal, onOutcome)
+  // No minGrade param — Sniper has its own internal grade filter.
+  // Same pipeline as V2 but isolated state.
+  const sniperE = sniperBySymbol[symbol];
+  if (sniperE) {
+    try {
+      SniperEngine.handlePrice(sniperE, bid, 0, onSniperSignal, onSniperOutcome);
+    } catch (err) {
+      console.error(`[SNIPER:${symbol}] handlePrice error:`, err.message);
+    }
+  }
+
+  // --- CL ENGINE ---
+  // CL is driven by 5m candles (not raw ticks). marketData.onTick builds the 5m candle
+  // and tells us when one closes (events.closed5m).
+  //
+  // Per-tick behavior:
+  //   - Always update CL's forming candle + run lifecycle track() (so fills/TPs/stops fire in real-time)
+  //   - On 5m close: push the just-closed candle to e.ltf, then run scanSig → onCLSignal if setup found
+  //
+  // Order matters: when closed5m is non-null, call handleKline(closed, x=true) FIRST so the
+  // previous forming candle gets pushed to e.ltf, THEN call handleKline(forming, x=false) to
+  // start the new period's forming candle.
+  const clE = clBySymbol[symbol];
+  if (clE) {
+    try {
+      // Update CL's current price directly (handleKline also does this, but set it here too
+      // in case handleKline is skipped on the very first tick before any 5m candle exists)
+      clE.price = bid;
+      clE.rawPrice = bid;
+      clE.lhb = Date.now();
+
+      // If a 5m candle just closed, push it to e.ltf via handleKline(closed, x=true)
+      if (events.closed5m) {
+        const closedK = Object.assign({}, events.closed5m, { x: true });
+        const status = CleanEngine.handleKline(clE, closedK, 0, onCLOutcome);
         if (status === 'closed') {
+          // Sync HTF (1h) + daily (PDH/PDL) from shared cache before scanning —
+          // market-data refreshes these on a separate schedule.
+          CleanEngine.syncFromCache(clE);
           try {
             const minGrade = process.env.CL_MIN_GRADE || 'B';
             const newsClear = process.env.CL_NEWS_CLEAR === 'true';
-            const setup = CleanEngine.runScan(e, minGrade, newsClear);
+            const setup = CleanEngine.runScan(clE, minGrade, newsClear);
             if (setup) {
-              onCLSignal(e, setup);
+              onCLSignal(clE, setup);
             }
           } catch (clErr) {
-            console.error(`[CL:${e.symbol}] scan error:`, clErr.message);
+            console.error(`[CL:${symbol}] scan error:`, clErr.message);
           }
         }
       }
-    } catch (ex) {
-      // ignore parse errors
-    }
-  });
 
-  ws.on('error', (err) => {
-    console.error(`[CL:${e.symbol}] WS error:`, err.message);
-  });
-
-  ws.on('close', () => {
-    console.log(`[CL:${e.symbol}] WS closed — reconnecting in ${CONFIG.reconnectDelay}ms`);
-    setTimeout(() => connectCL(e), CONFIG.reconnectDelay);
-  });
-
-  // Heartbeat check for CL
-  if (!e._clHeartbeat) {
-    e._clHeartbeat = setInterval(() => {
-      if (e.lhb && Date.now() - e.lhb > 45000) {
-        console.log(`[CL:${e.symbol}] No heartbeat in 45s — forcing reconnect`);
-        try { ws.terminate(); } catch (ex) {}
+      // Update forming candle (k.x=false) on every tick — keeps lifecycle track() running
+      // so filled/tp1/tp2/stopped events fire between candle closes.
+      if (events.forming5m) {
+        const formingK = Object.assign({}, events.forming5m, { x: false });
+        CleanEngine.handleKline(clE, formingK, 0, onCLOutcome);
       }
-    }, 15000);
+    } catch (err) {
+      console.error(`[CL:${symbol}] tick handler error:`, err.message);
+    }
+  }
+}
+
+// Exness WS status handler — logs state transitions for monitoring.
+// Auto-reconnect is handled inside exness-api.js; we just observe here.
+function onExnessStatus(status, info) {
+  const tag = '[ExnessWS]';
+  switch (status) {
+    case 'connecting':
+      console.log(tag, 'Connecting...', info ? info.url : '');
+      break;
+    case 'open':
+      console.log(tag, 'Connection opened — sending subscription...');
+      break;
+    case 'subscribed':
+      console.log(tag, 'Subscription confirmed — tick stream live for', info.instruments.join(', '));
+      break;
+    case 'reconnecting':
+      console.log(tag, 'Reconnecting in', info.delayMs + 'ms (backoff)');
+      break;
+    case 'closed':
+      console.log(tag, 'Closed — code:', info.code, info.reason ? ('reason: ' + info.reason) : '');
+      break;
+    case 'error':
+      console.error(tag, 'Error:', info);
+      break;
+    default:
+      console.log(tag, 'Status:', status, info || '');
   }
 }
 
@@ -799,8 +728,7 @@ const server = http.createServer(async (req, res) => {
       signal: e.signal ? e.signal.action : 'NONE',
       reason: e.signal ? e.signal.reason : '',
       lastFire: e.lastFireTime ? new Date(e.lastFireTime).toISOString() : null,
-      lastGrade: e.lastFireQuality,
-      wsState: sockets[e.symbol] ? sockets[e.symbol].readyState : 'closed'
+      lastGrade: e.lastFireQuality
     }));
     const sniperStatus = sniperEngines.map(e => ({
       symbol: e.symbol + '-SNIPER',
@@ -821,13 +749,13 @@ const server = http.createServer(async (req, res) => {
       setupGrade: (e.an && e.an.setup) ? e.an.setup.grade : null,
       setupDir: (e.an && e.an.setup) ? e.an.setup.dir : null,
       seenCount: Object.keys(e.seen).length,
-      wsState: clSockets[e.symbol] ? clSockets[e.symbol].readyState : 'closed',
       status: e.status
     }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       uptime: process.uptime(),
+      dataSrc: 'exness-native',
       engines: status,
       sniperEngines: sniperStatus,
       clEngines: clStatus,
@@ -848,6 +776,14 @@ const server = http.createServer(async (req, res) => {
       callCount: marketData.getCallCount(),
       cacheStats: marketData.getStats()
     }, null, 2));
+    return;
+  }
+
+  // ===== EXNESS API HEALTH CHECK =====
+  if (req.url === '/exness') {
+    const health = await exnessAPI.healthCheck();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(health, null, 2));
     return;
   }
 
@@ -960,50 +896,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Test endpoint — shows what Binance API returns from this server
-  if (req.url === '/test-fetch') {
-    try {
-      const r = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=3');
-      const text = await r.text();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ 
-        status: r.status, 
-        ok: r.ok,
-        bodyPreview: text.slice(0, 500),
-        isArray: text.startsWith('[')
-      }, null, 2));
-    } catch (err) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message, stack: err.stack }, null, 2));
-    }
-    return;
-  }
-
-  // Test endpoint 2 — try the fallback endpoint
-  if (req.url === '/test-fetch2') {
-    try {
-      const r = await fetch('https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=3');
-      const text = await r.text();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ 
-        status: r.status, 
-        ok: r.ok,
-        bodyPreview: text.slice(0, 500),
-        isArray: text.startsWith('[')
-      }, null, 2));
-    } catch (err) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }, null, 2));
-    }
-    return;
-  }
-
-  if (req.url === '/journal') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(journal, null, 2));
-    return;
-  }
-
   if (req.url === '/journal.csv') {
     const headers = ['Timestamp', 'Instrument', 'Action', 'Grade', 'EntryType', 'Entry', 'SL', 'TP1', 'TP2', 'TP3', 'ZoneRisk', 'RR1', 'Sweep', 'Trigger', 'Bias', 'Session', 'Outcome'];
     const rows = journal.map(s => [
@@ -1027,18 +919,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Update offset endpoint: POST /offset/BTC/50.5
-  const offsetMatch = req.url.match(/^\/offset\/(BTC|XAU)\/(-?[\d.]+)$/);
-  if (offsetMatch) {
-    const sym = offsetMatch[1];
-    const off = parseFloat(offsetMatch[2]);
-    offsetMap[sym] = off;
-    console.log(`[config] ${sym} offset updated to ${off}`);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, symbol: sym, offset: off }));
-    return;
-  }
-
   // Test Telegram endpoint — sends a test notification and shows the result
   if (req.url === '/test-ntfy' || req.url === '/test-telegram') {
     try {
@@ -1059,9 +939,9 @@ const server = http.createServer(async (req, res) => {
       }, null, 2));
     } catch (err) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ 
-        ok: false, 
-        error: err.message, 
+      res.end(JSON.stringify({
+        ok: false,
+        error: err.message,
         name: err.name,
         chatId: CONFIG.telegramChatId
       }, null, 2));
@@ -1070,7 +950,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   res.writeHead(404);
-  res.end('Not found. Use /health, /debug, /journal, /test-telegram, or /offset/SYMBOL/VALUE');
+  res.end('Not found. Use /health, /debug, /journal, /exness, /market-data, or /test-telegram');
 });
 
 const PORT = process.env.PORT || 8080;
@@ -1078,64 +958,69 @@ const HOST = '0.0.0.0';  // Render (and most cloud hosts) require binding to 0.0
 server.listen(PORT, HOST, () => {
   console.log(`\n========================================`);
   console.log(`  ZAI QUAD FRAMEWORK — Cloud Server`);
+  console.log(`  (Exness-native market data — no Binance, no TwelveData)`);
   console.log(`========================================`);
   console.log(`HTTP:  http://${HOST}:${PORT}/health`);
   console.log(`Telegram: ${CONFIG.telegramChatIds.length} recipient(s): ${CONFIG.telegramChatIds.join(', ')}`);
   console.log(`Grade: ${CONFIG.minGrade}-only filter (Engine V2)`);
-  console.log(`Engine V2: BTC + XAU (15m, 3/4 bias, 60-min sweep)`);
-  console.log(`Engine SNIPER: BTC + XAU only (15m, 4/4 bias, 30-min sweep) — isolated`);
-  console.log(`Engine CL: BTC + XAU (5m, 9-point checklist, FVG/OB, 1h HTF bias) — isolated, own WS`);
-  console.log(`Offsets: BTC=${offsetMap.BTC}, XAU=${offsetMap.XAU}`);
+  console.log(`Engine V2:     BTC + XAU (15m, 3/4 bias, 60-min sweep)`);
+  console.log(`Engine SNIPER: BTC + XAU (15m, 4/4 bias, 30-min sweep) — isolated`);
+  console.log(`Engine CL:     BTC + XAU (5m, 9-point checklist, FVG/OB, 1h HTF bias) — isolated`);
+  console.log(`Data source: Exness REST (bootstrap) + Exness WebSocket (live ticks)`);
   console.log(`========================================\n`);
 
-  // === SHARED DATA LAYER BOOTSTRAP ===
-  // market-data.js fetches 5m + 15m + 1h + 1d for ALL 2 instruments (BTC, XAU) in one pass.
-  // Total: 16 REST calls at startup, then 0 for 5m/15m (WebSocket), 96/day for 1h, 48/day for 1d.
-  // All 3 engines (V2, Sniper, CL) read from this shared cache.
+  // === BOOTSTRAP SEQUENCE ===
+  // 1. Fetch M5 + M15 + H1 + D1 for BTCUSD + XAUUSD from Exness REST (8 calls, ~6s with 600ms gaps)
+  // 2. Bootstrap each engine from the shared cache (no REST calls — just copy arrays)
+  // 3. Start scheduled refresh jobs (1h hourly, 1d every 2h)
+  // 4. Connect Exness WebSocket — tick stream drives all 3 engines from this point on
   (async () => {
-    console.log(`\n[${new Date().toISOString()}] Bootstrapping shared market-data layer...`);
-    await marketData.bootstrapAll(offsetMap);
+    console.log(`[${new Date().toISOString()}] Bootstrapping shared market-data layer from Exness REST...`);
+    await marketData.bootstrapAll();
     console.log(`[${new Date().toISOString()}] Shared data layer ready. Starting scheduled refresh jobs...`);
-    marketData.startScheduledRefresh(offsetMap);
-    console.log(`[${new Date().toISOString()}] Scheduled refresh jobs started.\n`);
+    marketData.startScheduledRefresh();
+    console.log(`[${new Date().toISOString()}] Scheduled refresh jobs started.`);
 
-    // === BOOTSTRAP V2 ENGINES (read from shared cache) ===
+    // === BOOTSTRAP V2 ENGINES (read from shared cache — no REST calls) ===
+    // Offset is always 0 — Exness IS the broker, prices are already correct.
     for (const e of engines) {
-      await bootstrap(e, offsetMap[e.symbol] || 0);
-      connect(e);  // V2 connects its own 15m WebSocket
-      await new Promise(r => setTimeout(r, 2000));  // 2s gap between WS connections
+      await bootstrap(e, 0);
+      await new Promise(r => setTimeout(r, 500));
     }
-    console.log(`[${new Date().toISOString()}] All V2 engines connected. Watching for signals...`);
+    console.log(`[${new Date().toISOString()}] V2 engines bootstrapped (BTC + XAU) from shared cache.`);
 
-    // === BOOTSTRAP SNIPER ENGINES (read from shared cache — no extra REST calls) ===
+    // === BOOTSTRAP SNIPER ENGINES (read from shared cache — no REST calls) ===
     if (!sniperBootstrapped) {
       sniperBootstrapped = true;
       for (const se of sniperEngines) {
-        await SniperEngine.bootstrap(se, offsetMap[se.symbol] || 0);
-        await new Promise(r => setTimeout(r, 1000));
+        await SniperEngine.bootstrap(se, 0);
+        await new Promise(r => setTimeout(r, 500));
       }
       console.log(`[${new Date().toISOString()}] SNIPER engines bootstrapped (BTC + XAU) from shared cache.`);
-      console.log(`[SNIPER] Now receiving mirrored ticks from V2 WebSocket connections.`);
-      console.log(`[SNIPER] Signals will push to Telegram with [SNIPER] prefix.\n`);
     }
 
-    // === BOOTSTRAP CL ENGINES (read from shared cache — no extra REST calls) ===
+    // === BOOTSTRAP CL ENGINES (read from shared cache — no REST calls) ===
     if (!clBootstrapped) {
       clBootstrapped = true;
       for (const ce of clEngines) {
-        await CleanEngine.bootstrap(ce, offsetMap[ce.symbol] || 0);
-        await new Promise(r => setTimeout(r, 1000));
+        await CleanEngine.bootstrap(ce, 0);
+        await new Promise(r => setTimeout(r, 500));
       }
       console.log(`[${new Date().toISOString()}] CL engines bootstrapped (BTC + XAU) from shared cache.`);
-      // Now connect CL's own 5m WebSocket for each instrument
-      clEngines.forEach(ce => connectCL(ce));
-      console.log(`[CL] 5m WebSocket connections established.`);
-      console.log(`[CL] Signals will push to Telegram with "CL BTC SELL" / "CL XAU BUY" prefix.\n`);
     }
+
+    // === START EXNESS WEBSOCKET ===
+    // This is the SINGLE real-time data source for all 3 engines.
+    // onExnessTick routes each tick into V2 + Sniper + CL.
+    // Auto-reconnect is handled inside exness-api.js (exponential backoff).
+    console.log(`[${new Date().toISOString()}] Starting Exness WebSocket tick stream...`);
+    exnessAPI.connectTicks(onExnessTick, onExnessStatus);
+    console.log(`[${new Date().toISOString()}] Exness WS started. All engines now receiving live ticks.`);
+    console.log(`========================================\n`);
   })();
 
   // Periodic maintenance every 5 min: retry bootstrap if engines have low candle count
-  // No more REST calls here — market-data.js handles all refreshes via scheduled jobs.
+  // No REST calls here — market-data.js handles all refreshes via scheduled jobs.
   setInterval(() => {
     engines.forEach(e => {
       if (e.c15.length < 50) {
@@ -1143,7 +1028,7 @@ server.listen(PORT, HOST, () => {
         if (!e._lastBootstrapRetry || now - e._lastBootstrapRetry > 300000) {
           e._lastBootstrapRetry = now;
           console.log(`[V2:${e.symbol}] Periodic bootstrap retry (c15=${e.c15.length})`);
-          bootstrap(e, offsetMap[e.symbol] || 0);
+          bootstrap(e, 0);
         }
       }
     });
@@ -1153,7 +1038,7 @@ server.listen(PORT, HOST, () => {
         if (!se._lastBootstrapRetry || now - se._lastBootstrapRetry > 300000) {
           se._lastBootstrapRetry = now;
           console.log(`[SNIPER:${se.symbol}] Periodic bootstrap retry (c15=${se.c15.length})`);
-          SniperEngine.bootstrap(se, offsetMap[se.symbol] || 0);
+          SniperEngine.bootstrap(se, 0);
         }
       }
     });
@@ -1163,7 +1048,7 @@ server.listen(PORT, HOST, () => {
         if (!ce._lastBootstrapRetry || now - ce._lastBootstrapRetry > 300000) {
           ce._lastBootstrapRetry = now;
           console.log(`[CL:${ce.symbol}] Periodic bootstrap retry (ltf=${ce.ltf.length}, htf=${ce.htf.length})`);
-          CleanEngine.bootstrap(ce, offsetMap[ce.symbol] || 0);
+          CleanEngine.bootstrap(ce, 0);
         }
       }
     });
@@ -1183,13 +1068,15 @@ server.listen(PORT, HOST, () => {
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received — closing sockets...');
+  console.log('SIGTERM received — closing Exness WS + HTTP server...');
   marketData.stopScheduledRefresh();
-  Object.values(sockets).forEach(ws => { try { ws.close(); } catch (e) {} });
-  Object.values(clSockets).forEach(ws => { try { ws.close(); } catch (e) {} });
+  try { exnessAPI.disconnectTicks(); } catch (e) {}
   server.close(() => process.exit(0));
 });
-process.on('SIGINT', () => process.exit(0));
+process.on('SIGINT', () => {
+  try { exnessAPI.disconnectTicks(); } catch (e) {}
+  process.exit(0);
+});
 
 // Catch uncaught errors so the process doesn't die
 process.on('uncaughtException', (err) => {

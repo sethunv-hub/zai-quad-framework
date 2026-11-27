@@ -12,10 +12,17 @@
 // Instruments: BTC + XAU only (per user request — matches cl-btc-xau.html)
 // Push prefix: "CL BTC SELL" / "CL XAU BUY" (per user request — exactly matches HTML format)
 //
+// DATA SOURCE (updated — Exness-native):
+//   - CL no longer has its own WebSocket connection.
+//   - All real-time data comes from the shared Exness WebSocket via market-data.js.
+//   - server.js calls handleKline() on every Exness tick (forming mode) for lifecycle tracking,
+//     and additionally on 5m candle close (closed mode) to push to e.ltf + trigger runScan.
+//   - 1h HTF + 1d PDH/PDL are synced from the shared cache via syncFromCache() before each scan.
+//
 // ISOLATION GUARANTEE:
 //   - This file does NOT import or modify smc-engine.js or smc-engine-sniper.js
 //   - V2 and Sniper engines are completely independent
-//   - CL engine has its own WebSocket (5m kline stream), own state, own push, own journal
+//   - CL engine has its own state, own push, own journal — but shares the Exness WS tick stream
 
 'use strict';
 
@@ -77,7 +84,9 @@ function makeCLEngine(symbol, stream, config) {
     // Analysis cache
     an: null,         // last scan result
     // Bookkeeping
-    status: 'connecting',
+    // status flow: 'waiting' (pre-bootstrap) → 'live' (after bootstrap, receiving ticks)
+    // No more 'connecting' state — CL no longer owns a WebSocket connection.
+    status: 'waiting',
     lastScan: 0,
     lhb: 0
   };
@@ -277,7 +286,9 @@ function scan(C, H, D, opt) {
 }
 
 // ===== BOOTSTRAP (CL — reads from shared market-data cache) =====
-// No REST calls — all data comes from market-data.js which fetches once per instrument.
+// No REST calls — all data comes from market-data.js which fetches M5+M15+H1+D1 from Exness REST
+// at startup. This function just copies the cached arrays into CL's internal state.
+// Offset is always 0 — Exness IS the broker, prices are already correct.
 async function bootstrap(e, offset) {
   if (e.ltf.length >= 80 && e.htf.length >= 20 && e.daily) return;
   console.log(`[CL:${e.symbol}] Bootstrap from shared cache...`);
@@ -359,9 +370,17 @@ function syncFromCache(e) {
   }
 }
 
-// ===== KLINE HANDLER (process a 5m kline WS message) =====
-// Returns 'closed' if a 5m candle just closed, 'forming' if still forming, 'duplicate' if re-received
-// CRITICAL: also runs lifecycle track() on every tick so filled/tp1/tp2/stopped events fire in real-time
+// ===== KLINE HANDLER (process a 5m candle from the shared Exness tick stream) =====
+// Called by server.js on every Exness tick with the built 5m candle from market-data.js.
+//   - On every tick (forming mode, k.x=false): updates e.forming + runs lifecycle track()
+//     so filled/tp1/tp2/stopped events fire in real-time between candle closes.
+//   - On 5m close (closed mode, k.x=true): pushes e.forming to e.ltf + runs track() in 'closed' mode.
+//     server.js checks the return value; if 'closed', it calls runScan() to look for new setups.
+//
+// k format (built by market-data.js, augmented by server.js with x flag):
+//   { t, o, h, l, c, v, x }   — t = ms epoch, x = isClosed boolean
+//
+// Returns 'closed' if a 5m candle just closed, 'forming' if still forming, 'duplicate' if re-received.
 // onOutcome callback: (e, outcomeType, sig) => void
 function handleKline(e, k, offset, onOutcome) {
   const t = k.t; // candle open time in ms
@@ -467,6 +486,24 @@ const tpHit = (g, p, h, l) => sigDir(g) ? h >= p : l <= p;
 
 function track(e, h, l, mode, bar, onOutcome) {
   const g = e.sig; if (!g) return;
+  const isLong = sigDir(g);
+
+  // MFE/MAE tracking — how far price went favorable/adverse from entry
+  if (g.maxFavorable === undefined) {
+    g.maxFavorable = null;
+    g.maxAdverse = null;
+  }
+  // Use h (high) and l (low) for CL since it receives full candle data
+  const favorablePrice = isLong ? h : l;
+  const adversePrice = isLong ? l : h;
+  if (isLong) {
+    if (g.maxFavorable === null || h > g.maxFavorable) g.maxFavorable = h;
+    if (g.maxAdverse === null || l < g.maxAdverse) g.maxAdverse = l;
+  } else {
+    if (g.maxFavorable === null || l < g.maxFavorable) g.maxFavorable = l;
+    if (g.maxAdverse === null || h > g.maxAdverse) g.maxAdverse = h;
+  }
+
   if (g.status === 'pending') {
     const filled = fillHit(g, h, l);
     if (mode === 'closed') {
