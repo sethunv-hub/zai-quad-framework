@@ -320,36 +320,37 @@ async function onV2Outcome(e, outcomeType, sig) {
   const instShort = e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const phtStr = fmtPht(Date.now());
+  const formedStr = e.sigFormedAt ? fmtPht(e.sigFormedAt) : '—';
 
   let title = '', msg = '';
   switch (outcomeType) {
     case 'filled':
-      title = `✅ [V2] ${instShort} ${dir} entry reached`;
-      msg = `Price tapped ${fmtPrice(e.symbol, sig.entry)}. SL ${fmtPrice(e.symbol, sig.sl)} | TP1 ${fmtPrice(e.symbol, sig.tp1)} | Time: ${phtStr}`;
+      title = `✅ [V2] ${instShort} ${dir} — ENTRY REACHED`;
+      msg = `Entry: ${fmtPrice(e.symbol, sig.entry)} | SL: ${fmtPrice(e.symbol, sig.sl)} | TP1: ${fmtPrice(e.symbol, sig.tp1)}\nFormed: ${formedStr} | Filled: ${phtStr}`;
       break;
     case 'tp1':
-      title = `🎯 [V2] ${instShort} TP1 hit`;
-      msg = `TP1 ${fmtPrice(e.symbol, sig.tp1)} reached. Consider partial + move SL to break-even. | Time: ${phtStr}`;
+      title = `🎯 [V2] ${instShort} ${dir} — TP1 HIT`;
+      msg = `Entry: ${fmtPrice(e.symbol, sig.entry)} | SL: ${fmtPrice(e.symbol, sig.sl)} | TP1: ${fmtPrice(e.symbol, sig.tp1)} ✅\nFormed: ${formedStr} | TP1: ${phtStr}`;
       break;
     case 'tp2':
-      title = `🏆 [V2] ${instShort} TP2 hit +${(sig.outcomeR || 0).toFixed(2)}R`;
-      msg = `Full target ${fmtPrice(e.symbol, sig.tp2)} reached. | Time: ${phtStr}`;
+      title = `🏆 [V2] ${instShort} ${dir} — TP2 HIT +${(sig.outcomeR || 0).toFixed(2)}R`;
+      msg = `Entry: ${fmtPrice(e.symbol, sig.entry)} | TP2: ${fmtPrice(e.symbol, sig.tp2)} ✅\nFormed: ${formedStr} | Closed: ${phtStr}`;
       break;
     case 'stopped':
-      title = `❌ [V2] ${instShort} ${dir} stopped -1R`;
-      msg = `Stop ${fmtPrice(e.symbol, sig.sl)} hit. | Time: ${phtStr}`;
+      title = `❌ [V2] ${instShort} ${dir} — STOPPED -1R`;
+      msg = `Entry: ${fmtPrice(e.symbol, sig.entry)} | SL: ${fmtPrice(e.symbol, sig.sl)} | TP1: ${fmtPrice(e.symbol, sig.tp1)}\nFormed: ${formedStr} | Stopped: ${phtStr}`;
       break;
     case 'missed':
-      title = `⏳ [V2] ${instShort} ${dir} setup missed`;
-      msg = `Price reached TP1 without filling entry. Do not chase. | Time: ${phtStr}`;
+      title = `⏳ [V2] ${instShort} ${dir} — MISSED`;
+      msg = `Entry: ${fmtPrice(e.symbol, sig.entry)} | TP1: ${fmtPrice(e.symbol, sig.tp1)} (reached without fill)\nFormed: ${formedStr} | Missed: ${phtStr}`;
       break;
     case 'invalid':
-      title = `🚫 [V2] ${instShort} ${dir} invalidated`;
-      msg = `Price closed beyond stop before filling. Cancelled. | Time: ${phtStr}`;
+      title = `🚫 [V2] ${instShort} ${dir} — INVALIDATED`;
+      msg = `Entry: ${fmtPrice(e.symbol, sig.entry)} | SL: ${fmtPrice(e.symbol, sig.sl)}\nFormed: ${formedStr} | Invalidated: ${phtStr}`;
       break;
     case 'expired':
-      title = `⌛ [V2] ${instShort} ${dir} expired`;
-      msg = `Entry not reached within 40 bars. Cancelled. | Time: ${phtStr}`;
+      title = `⌛ [V2] ${instShort} ${dir} — EXPIRED`;
+      msg = `Entry: ${fmtPrice(e.symbol, sig.entry)} (not reached in 40 bars)\nFormed: ${formedStr} | Expired: ${phtStr}`;
       break;
     default: return;
   }
@@ -364,36 +365,37 @@ async function onSniperOutcome(e, outcomeType, sig) {
   const instShort = e.symbol;
   const dir = sig.action === 'LONG' ? 'BUY' : 'SELL';
   const phtStr = SniperEngine.fmtPht(Date.now());
+  const formedStr = e.sigFormedAt ? SniperEngine.fmtPht(e.sigFormedAt) : '—';
 
   let title = '', msg = '';
   switch (outcomeType) {
     case 'filled':
-      title = `✅ [SNIPER] ${instShort} ${dir} entry reached`;
-      msg = `Price tapped ${SniperEngine.fmtPrice(e.symbol, sig.entry)}. SL ${SniperEngine.fmtPrice(e.symbol, sig.sl)} | TP1 ${SniperEngine.fmtPrice(e.symbol, sig.tp1)} | Time: ${phtStr}`;
+      title = `✅ [SNIPER] ${instShort} ${dir} — ENTRY REACHED`;
+      msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${SniperEngine.fmtPrice(e.symbol, sig.sl)} | TP1: ${SniperEngine.fmtPrice(e.symbol, sig.tp1)}\nFormed: ${formedStr} | Filled: ${phtStr}`;
       break;
     case 'tp1':
-      title = `🎯 [SNIPER] ${instShort} TP1 hit`;
-      msg = `TP1 ${SniperEngine.fmtPrice(e.symbol, sig.tp1)} reached. Consider partial + move SL to break-even. | Time: ${phtStr}`;
+      title = `🎯 [SNIPER] ${instShort} ${dir} — TP1 HIT`;
+      msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${SniperEngine.fmtPrice(e.symbol, sig.sl)} | TP1: ${SniperEngine.fmtPrice(e.symbol, sig.tp1)} ✅\nFormed: ${formedStr} | TP1: ${phtStr}`;
       break;
     case 'tp2':
-      title = `🏆 [SNIPER] ${instShort} TP2 hit +${(sig.outcomeR || 0).toFixed(2)}R`;
-      msg = `Full target ${SniperEngine.fmtPrice(e.symbol, sig.tp2)} reached. | Time: ${phtStr}`;
+      title = `🏆 [SNIPER] ${instShort} ${dir} — TP2 HIT +${(sig.outcomeR || 0).toFixed(2)}R`;
+      msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)} | TP2: ${SniperEngine.fmtPrice(e.symbol, sig.tp2)} ✅\nFormed: ${formedStr} | Closed: ${phtStr}`;
       break;
     case 'stopped':
-      title = `❌ [SNIPER] ${instShort} ${dir} stopped -1R`;
-      msg = `Stop ${SniperEngine.fmtPrice(e.symbol, sig.sl)} hit. | Time: ${phtStr}`;
+      title = `❌ [SNIPER] ${instShort} ${dir} — STOPPED -1R`;
+      msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${SniperEngine.fmtPrice(e.symbol, sig.sl)} | TP1: ${SniperEngine.fmtPrice(e.symbol, sig.tp1)}\nFormed: ${formedStr} | Stopped: ${phtStr}`;
       break;
     case 'missed':
-      title = `⏳ [SNIPER] ${instShort} ${dir} setup missed`;
-      msg = `Price reached TP1 without filling entry. Do not chase. | Time: ${phtStr}`;
+      title = `⏳ [SNIPER] ${instShort} ${dir} — MISSED`;
+      msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)} | TP1: ${SniperEngine.fmtPrice(e.symbol, sig.tp1)} (reached without fill)\nFormed: ${formedStr} | Missed: ${phtStr}`;
       break;
     case 'invalid':
-      title = `🚫 [SNIPER] ${instShort} ${dir} invalidated`;
-      msg = `Price closed beyond stop before filling. Cancelled. | Time: ${phtStr}`;
+      title = `🚫 [SNIPER] ${instShort} ${dir} — INVALIDATED`;
+      msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${SniperEngine.fmtPrice(e.symbol, sig.sl)}\nFormed: ${formedStr} | Invalidated: ${phtStr}`;
       break;
     case 'expired':
-      title = `⌛ [SNIPER] ${instShort} ${dir} expired`;
-      msg = `Entry not reached within 40 bars. Cancelled. | Time: ${phtStr}`;
+      title = `⌛ [SNIPER] ${instShort} ${dir} — EXPIRED`;
+      msg = `Entry: ${SniperEngine.fmtPrice(e.symbol, sig.entry)} (not reached in 40 bars)\nFormed: ${formedStr} | Expired: ${phtStr}`;
       break;
     default: return;
   }
@@ -508,41 +510,42 @@ async function onCLOutcome(e, outcomeType, sig) {
   const instShort = { BTC: 'BTC', XAU: 'XAU' }[e.symbol] || e.symbol;
   const dir = sig.dir === 'long' ? 'BUY' : 'SELL';
   const phtStr = CleanEngine.fmtPht(Date.now());
+  const formedStr = sig.formedAt ? CleanEngine.fmtPht(sig.formedAt) : '—';
 
-  // Build title + message based on outcome type (matches HTML EV map)
+  // Build title + message based on outcome type
   let title = '', msg = '';
   switch (outcomeType) {
     case 'filled':
-      title = `✅ CL ${instShort} ${dir} entry zone reached`;
-      msg = `Price tapped ${CleanEngine.fmtPrice(e.symbol, sig.entry)}. SL ${CleanEngine.fmtPrice(e.symbol, sig.stop)} | TP1 ${CleanEngine.fmtPrice(e.symbol, sig.tp1)} | Time: ${phtStr}`;
+      title = `✅ [CL] ${instShort} ${dir} — ENTRY REACHED`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${CleanEngine.fmtPrice(e.symbol, sig.stop)} | TP1: ${CleanEngine.fmtPrice(e.symbol, sig.tp1)}\nFormed: ${formedStr} | Filled: ${phtStr}`;
       break;
     case 'tp1':
-      title = `🎯 CL ${instShort} TP1 hit`;
-      msg = `TP1 ${CleanEngine.fmtPrice(e.symbol, sig.tp1)} reached. Consider a partial and moving the stop to break-even. | Time: ${phtStr}`;
+      title = `🎯 [CL] ${instShort} ${dir} — TP1 HIT`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${CleanEngine.fmtPrice(e.symbol, sig.stop)} | TP1: ${CleanEngine.fmtPrice(e.symbol, sig.tp1)} ✅\nFormed: ${formedStr} | TP1: ${phtStr}`;
       break;
     case 'tp2':
-      title = `🏆 CL ${instShort} TP2 hit +${(sig.r || 0).toFixed(2)}R`;
-      msg = `Full target ${CleanEngine.fmtPrice(e.symbol, sig.tp2)} reached. | Time: ${phtStr}`;
+      title = `🏆 [CL] ${instShort} ${dir} — TP2 HIT +${(sig.r || 0).toFixed(2)}R`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} | TP2: ${CleanEngine.fmtPrice(e.symbol, sig.tp2)} ✅\nFormed: ${formedStr} | Closed: ${phtStr}`;
       break;
     case 'be':
-      title = `🤝 CL ${instShort} closed at break-even after TP1 +${(sig.r || 0).toFixed(2)}R`;
-      msg = `Price returned to entry after TP1. | Time: ${phtStr}`;
+      title = `🤝 [CL] ${instShort} ${dir} — BREAK-EVEN +${(sig.r || 0).toFixed(2)}R`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} | TP1: ${CleanEngine.fmtPrice(e.symbol, sig.tp1)} (hit, then returned to entry)\nFormed: ${formedStr} | Closed: ${phtStr}`;
       break;
     case 'stopped':
-      title = `❌ CL ${instShort} ${dir} stopped out -1R`;
-      msg = `Stop ${CleanEngine.fmtPrice(e.symbol, sig.stop)} hit. Review before the next trade. | Time: ${phtStr}`;
+      title = `❌ [CL] ${instShort} ${dir} — STOPPED -1R`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${CleanEngine.fmtPrice(e.symbol, sig.stop)} | TP1: ${CleanEngine.fmtPrice(e.symbol, sig.tp1)}\nFormed: ${formedStr} | Stopped: ${phtStr}`;
       break;
     case 'missed':
-      title = `⏳ CL ${instShort} ${dir} setup missed`;
-      msg = `Price reached TP1 without filling the entry. Do not chase. | Time: ${phtStr}`;
+      title = `⏳ [CL] ${instShort} ${dir} — MISSED`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} | TP1: ${CleanEngine.fmtPrice(e.symbol, sig.tp1)} (reached without fill)\nFormed: ${formedStr} | Missed: ${phtStr}`;
       break;
     case 'invalid':
-      title = `🚫 CL ${instShort} ${dir} setup invalidated`;
-      msg = `Price closed beyond the stop before filling. Idea cancelled. | Time: ${phtStr}`;
+      title = `🚫 [CL] ${instShort} ${dir} — INVALIDATED`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} | SL: ${CleanEngine.fmtPrice(e.symbol, sig.stop)}\nFormed: ${formedStr} | Invalidated: ${phtStr}`;
       break;
     case 'expired':
-      title = `⌛ CL ${instShort} ${dir} setup expired`;
-      msg = `Entry not reached within 40 bars. Idea cancelled. | Time: ${phtStr}`;
+      title = `⌛ [CL] ${instShort} ${dir} — EXPIRED`;
+      msg = `Entry: ${CleanEngine.fmtPrice(e.symbol, sig.entry)} (not reached in 40 bars)\nFormed: ${formedStr} | Expired: ${phtStr}`;
       break;
     default:
       return; // unknown outcome type — skip
