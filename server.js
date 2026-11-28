@@ -1020,8 +1020,18 @@ server.listen(PORT, HOST, () => {
   })();
 
   // Periodic maintenance every 5 min: retry bootstrap if engines have low candle count
-  // No REST calls here — market-data.js handles all refreshes via scheduled jobs.
+  // Also checks for missing H1 candles (needed by CL engine) and retries market-data fetch
   setInterval(() => {
+    // Check market-data cache for missing timeframes and retry
+    const mdStats = marketData.getStats();
+    for (const sym of ['BTC', 'XAU']) {
+      const stats = mdStats[sym];
+      if (stats && stats['1h'] === 0) {
+        console.log(`[MarketData] ${sym} H1 candles missing — triggering immediate 1h refresh`);
+        marketData.refresh1h(sym).catch(() => {});
+      }
+    }
+
     engines.forEach(e => {
       if (e.c15.length < 50) {
         const now = Date.now();

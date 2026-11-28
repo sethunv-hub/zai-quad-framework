@@ -550,19 +550,34 @@ async function healthCheck() {
       rateStats: getRateStats()
     };
   }
-  const balance = await getBalance();
   const wsConnected = _ws && _ws.readyState === WebSocket.OPEN;
+  // Use WebSocket connection status as primary health indicator.
+  // Balance endpoint can fail on account-specific host (known issue) — WS is the real signal.
+  if (wsConnected) {
+    return {
+      configured: true,
+      connected: true,
+      message: 'WebSocket connected — real-time ticks flowing',
+      accountId: EXNESS_ACCOUNT_ID,
+      accessPoint: cachedAccessPoint,
+      wsConnected: true,
+      wsLastTickAt: _wsLastTickAt ? new Date(_wsLastTickAt).toISOString() : null,
+      subscribedInstruments: SUB_INSTRUMENTS,
+      rateStats: getRateStats()
+    };
+  }
+  // If WS is down, try balance endpoint as fallback
+  const balance = await getBalance();
   if (balance) {
     return {
       configured: true,
       connected: true,
+      message: 'REST connected (WebSocket reconnecting)',
       accountId: EXNESS_ACCOUNT_ID,
       accessPoint: cachedAccessPoint,
       balance: balance.amount,
       currency: balance.currency,
-      wsConnected: wsConnected,
-      wsLastTickAt: _wsLastTickAt ? new Date(_wsLastTickAt).toISOString() : null,
-      subscribedInstruments: SUB_INSTRUMENTS,
+      wsConnected: false,
       rateStats: getRateStats()
     };
   }
@@ -571,7 +586,7 @@ async function healthCheck() {
     connected: false,
     accountId: EXNESS_ACCOUNT_ID,
     accessPoint: cachedAccessPoint,
-    wsConnected: wsConnected,
+    wsConnected: false,
     message: 'API auth failed or balance endpoint unavailable',
     rateStats: getRateStats()
   };
